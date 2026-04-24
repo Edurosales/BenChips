@@ -53,23 +53,26 @@ def _prompt_options() -> dict:
         resp = input(f"  {C}?{W}  {question} [s/N]: ").strip().lower()
         return resp in ("s", "si", "sí", "y", "yes", "1")
 
-    full   = ask("Escaneo completo  (subdominios + crt.sh)")
-    active = ask("Escaneo activo    (SQLi / XSS / Traversal / SSRF)")
-    ports  = not ask("Omitir puertos    (port scan)")
-    html   = ask("Generar reporte   HTML")
-    json_r = ask("Generar reporte   JSON")
+    full    = ask("Escaneo completo  (subdominios + crt.sh)")
+    active  = ask("Escaneo activo    (SQLi / XSS / Traversal / SSRF)")
+    ports   = not ask("Omitir puertos    (port scan)")
+    stealth = ask("Modo sigiloso     (UA rotación + delays, evita detección WAF/IDS)")
+    html    = ask("Generar reporte   HTML")
+    json_r  = ask("Generar reporte   JSON")
+    pdf     = ask("Generar reporte   PDF (Ejecutivo)")
 
-    out_name = ""
-    if html or json_r:
-        out_name = input(f"\n  {C}?{W}  Nombre base del reporte (Enter = auto): ").strip()
+    print()
+    out = input(f"  {C}?{W}  Nombre base del reporte (Enter = auto): ").strip()
 
     return {
-        "full":   full,
-        "active": active,
-        "ports":  ports,
-        "html":   html,
-        "json":   json_r,
-        "output": out_name,
+        "full":    full,
+        "active":  active,
+        "ports":   ports,
+        "stealth": stealth,
+        "html":    html,
+        "json":    json_r,
+        "pdf":     pdf,
+        "output":  out,
     }
 
 
@@ -78,13 +81,16 @@ def _prompt_options() -> dict:
 async def _run(url: str, opts: dict):
     from scanner import scan
     from utils.vuln import count_by_severity, risk_score
-    from report import generate_html, generate_json
+    from report import generate_html, generate_json, generate_pdf
 
     banner(VERSION)
     print(f"  {BOLD}{C}Objetivo:{W} {url}")
+    stealth_tag = f" | {G}● Sigiloso{W}" if opts.get("stealth") else ""
     print(f"  {DIM}Modo: {'COMPLETO' if opts['full'] else 'ESTÁNDAR'} | "
           f"Activo: {'SÍ' if opts['active'] else 'NO'} | "
-          f"Puertos: {'SÍ' if opts['ports'] else 'NO'}{W}")
+          f"Puertos: {'SÍ' if opts['ports'] else 'NO'}{stealth_tag}{W}")
+    if opts.get("stealth"):
+        print(f"  {DIM}▶  Stealth: UA rotation + delays aleatorios activos{W}")
     print_sep()
 
     try:
@@ -93,6 +99,7 @@ async def _run(url: str, opts: dict):
             full_scan   = opts["full"],
             scan_ports  = opts["ports"],
             active_scan = opts["active"],
+            stealth     = opts.get("stealth", False),
         )
     except Exception as e:
         print_err(f"Error durante el escaneo: {e}")
@@ -146,6 +153,15 @@ async def _run(url: str, opts: dict):
             generated.append(f"JSON → {os.path.abspath(json_path)}")
         except Exception as e:
             print_err(f"Error generando JSON: {e}")
+
+    if opts.get("pdf"):
+        pdf_path = base_path + ".pdf"
+        try:
+            from report import generate_pdf
+            if generate_pdf(url, vulns, meta, duration, pdf_path):
+                generated.append(f"PDF  → {os.path.abspath(pdf_path)}")
+        except Exception as e:
+            print_err(f"Error generando PDF: {e}")
 
     if generated:
         print(f"\n  {G}📄 Reportes generados:{W}")

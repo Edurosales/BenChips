@@ -1,0 +1,17 @@
+id: env-file-exposure
+info:
+  name: Config / Environment File Exposure
+  severity: HIGH
+  description: Busca archivos .env expuestos que pueden contener credenciales.
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.env"
+      - "{{BaseURL}}/config/.env"
+    matchers:
+      - type: word
+        part: body
+        words:
+          - "DB_PASSWORD="
+          - "APP_KEY="
+          - "AWS_ACCESS_KEY"

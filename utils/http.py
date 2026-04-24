@@ -72,24 +72,51 @@ class AsyncHTTPClient:
     - Retry con backoff exponencial
     - Baseline soft-404 por hostname
     - SSL lax opcional
+    - Stealth mode: rotación de UA, headers de browser real, delays aleatorios
     """
 
     def __init__(
         self,
-        session: "aiohttp.ClientSession",
-        rate_limit:   int = 25,
-        timeout:      int = 8,
-        max_retries:  int = 2,
+        session:      "aiohttp.ClientSession",
+        rate_limit:   int  = 25,
+        timeout:      int  = 8,
+        max_retries:  int  = 2,
+        stealth:      bool = False,
     ):
         self.session     = session
         self.semaphore   = asyncio.Semaphore(rate_limit)
         self.timeout     = aiohttp.ClientTimeout(total=timeout, connect=5)
         self.max_retries = max_retries
+        self.stealth     = stealth
         self.baselines:  dict[str, Baseline] = {}
-        self._headers = {
+
+        # Headers base (no-stealth)
+        self._base_headers = {
             "User-Agent": UA,
             "Accept":     "text/html,application/json,*/*;q=0.8",
         }
+
+    def _build_headers(self, extra: Optional[dict] = None) -> dict:
+        """Construye los headers para una petición, con o sin stealth."""
+        if self.stealth:
+            import random
+            from config import USER_AGENTS, STEALTH_HEADERS
+            ua   = random.choice(USER_AGENTS)
+            hdrs = dict(STEALTH_HEADERS)
+            hdrs["User-Agent"] = ua
+        else:
+            hdrs = dict(self._base_headers)
+
+        if extra:
+            hdrs.update(extra)
+        return hdrs
+
+    async def _stealth_delay(self) -> None:
+        """Aplica un delay aleatorio si stealth está activo."""
+        if self.stealth:
+            import random
+            from config import STEALTH_DELAY_MIN, STEALTH_DELAY_MAX
+            await asyncio.sleep(random.uniform(STEALTH_DELAY_MIN, STEALTH_DELAY_MAX))
 
     async def request(
         self,
@@ -100,11 +127,8 @@ class AsyncHTTPClient:
         extra_headers: Optional[dict] = None,
         body_limit:    int  = 65536,
     ) -> Optional[Response]:
-        ssl_ctx = False if lax_ssl else None
-        hdrs    = dict(self._headers)
-        if extra_headers:
-            hdrs.update(extra_headers)
-
+        ssl_ctx       = False if lax_ssl else None
+        hdrs          = self._build_headers(extra_headers)
         max_redirects = 10 if follow else 0
 
         for attempt in range(self.max_retries + 1):
@@ -112,14 +136,15 @@ class AsyncHTTPClient:
                 try:
                     async with self.session.request(
                         method, url,
-                        headers        = hdrs,
-                        ssl            = ssl_ctx,
-                        allow_redirects= follow,
-                        max_redirects  = max_redirects,
-                        timeout        = self.timeout,
+                        headers         = hdrs,
+                        ssl             = ssl_ctx,
+                        allow_redirects = follow,
+                        max_redirects   = max_redirects,
+                        timeout         = self.timeout,
                     ) as r:
                         body = await r.read()
                         body = body[:body_limit]
+                        await self._stealth_delay()
                         return Response(r.status, dict(r.headers), body, str(r.url))
 
                 except asyncio.TimeoutError:
@@ -173,10 +198,10 @@ class AsyncHTTPClient:
 def create_session() -> "aiohttp.ClientSession":
     """Crea una sesión aiohttp con connector optimizado."""
     connector = aiohttp.TCPConnector(
-        limit           = 100,
-        limit_per_host  = 30,
-        ssl             = False,
-        force_close     = False,
-        enable_cleanup_closed = True,
+        limit                = 100,
+        limit_per_host       = 30,
+        ssl                  = False,
+        force_close          = False,
+        enable_cleanup_closed= True,
     )
     return aiohttp.ClientSession(connector=connector)

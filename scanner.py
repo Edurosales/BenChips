@@ -18,7 +18,7 @@ from utils.colors import (
     print_vuln, progress_bar, print_sep, sev_color, W, BOLD, C, G, O, DIM
 )
 
-from modules import recon, headers, ssl_tls, http_methods, paths, ports, redirects, waf, content, active, api_discovery
+from modules import recon, headers, ssl_tls, http_methods, paths, ports, redirects, waf, content, active, api_discovery, js_cve, ssti, admin_panels, forms, jwt_scan, graphql, xxe, yaml_engine
 
 
 async def scan(
@@ -27,6 +27,7 @@ async def scan(
     scan_ports:  bool = True,
     active_scan: bool = False,
     no_color:    bool = False,
+    stealth:     bool = False,
 ) -> tuple[list[Vuln], dict, float]:
     """
     Ejecuta el escaneo completo de forma async.
@@ -58,13 +59,13 @@ async def scan(
 
     all_vulns: list[Vuln] = []
 
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(
-            limit=100, limit_per_host=30,
-            ssl=False, enable_cleanup_closed=True
-        )
-    ) as session:
-        client = AsyncHTTPClient(session, rate_limit=20, timeout=10)
+    connector = aiohttp.TCPConnector(
+        limit=100, limit_per_host=30,
+        ssl=False, enable_cleanup_closed=True
+    )
+    session = aiohttp.ClientSession(connector=connector)
+    try:
+        client = AsyncHTTPClient(session, rate_limit=20, timeout=10, stealth=stealth)
 
         # ── 1. WAF Detection ──────────────────────────────────────────────────
         print_section("1/9", "WAF / CDN Detection")
@@ -132,6 +133,19 @@ async def scan(
         else:
             print_ok("Solo GET/POST/HEAD permitidos")
 
+        # ── 5.5. Admin Panels ─────────────────────────────────────────────────
+        print_section("Admin", "Paneles de Administración")
+        admin_vulns, admin_data = await admin_panels.run(client, url, technologies=meta.get("technologies", []))
+        all_vulns.extend(admin_vulns)
+        meta["admin_panels"] = admin_data
+        exposed = [p for p in admin_data if p.get("login")]
+        if exposed:
+            print_warn(f"[{len(exposed)}] Paneles de administración con login expuestos")
+        elif admin_data:
+            print_info(f"[{len(admin_data)}] Rutas protegidas/redirigidas de admin encontradas")
+        else:
+            print_ok("Sin paneles de administración expuestos")
+
         # ── 6. Sensitive Paths ────────────────────────────────────────────────
         print_section("6/9", f"Rutas Sensibles ({len(paths.SENSITIVE_PATHS) if hasattr(paths, 'SENSITIVE_PATHS') else '...'})")
         # Usamos la lista de config
@@ -183,6 +197,24 @@ async def scan(
         if not redir_vulns and not content_vulns:
             print_ok("Sin open redirect ni leakage de contenido")
 
+        # ── 8.5. JS Vulnerable Libraries ──────────────────────────────────────
+        print_section("JS", "Librerías JavaScript Vulnerables")
+        js_vulns = await js_cve.run(client, url, body_text)
+        all_vulns.extend(js_vulns)
+        if js_vulns:
+            print_warn(f"[{len(js_vulns)}] Librerías vulnerables (CVEs detectados)")
+        else:
+            print_ok("Sin librerías JS vulnerables conocidas")
+
+        # ── 8.8. JWT Analysis ─────────────────────────────────────────────────
+        print_section("JWT", "Análisis de Tokens JWT")
+        jwt_vulns = await jwt_scan.run(client, url, body_text=body_text, headers=main_resp.headers if main_resp else None)
+        all_vulns.extend(jwt_vulns)
+        if jwt_vulns:
+            print_warn(f"[{len(jwt_vulns)}] Vulnerabilidades en JWT encontradas")
+        else:
+            print_ok("Sin JWTs vulnerables detectados")
+
         # ── 9. API & Endpoint Discovery ───────────────────────────────────────
         print_section("9/10", "Descubrimiento de API & Endpoints")
         api_vulns, api_data = await api_discovery.run(client, url, body_text)
@@ -196,16 +228,55 @@ async def scan(
 
         # ── 10. Active Scan ────────────────────────────────────────────────────
         if active_scan:
-            print_section("10/10", "Escaneo Activo (SQLi / XSS / Traversal / SSRF)")
+            print_section("10/10", "Escaneo Activo (SQLi / SSTI / XSS / Traversal / SSRF)")
+            
+            # SSTI
+            ssti_vulns = await ssti.run(client, url, full_scan=full_scan)
+            all_vulns.extend(ssti_vulns)
+            if ssti_vulns:
+                print_warn(f"SSTI: {len(ssti_vulns)} hallazgos")
+                
+            # Resto de activos
             active_vulns = await active.run(client, url, full_scan=full_scan)
             all_vulns.extend(active_vulns)
-            if active_vulns:
-                crits = sum(1 for v in active_vulns if v.severity == "CRITICAL")
-                print_warn(f"Activo: {len(active_vulns)} hallazgos ({crits} críticos)")
+            
+            # Forms
+            form_vulns = await forms.run(client, url, body_text=body_text)
+            all_vulns.extend(form_vulns)
+            if form_vulns:
+                print_warn(f"Forms: {len(form_vulns)} hallazgos")
+
+            # GraphQL
+            gql_vulns = await graphql.run(client, url)
+            all_vulns.extend(gql_vulns)
+            if gql_vulns:
+                print_warn(f"GraphQL: {len(gql_vulns)} hallazgos")
+
+            # XXE
+            xxe_vulns = await xxe.run(client, url, api_endpoints=meta.get("api_endpoints", []))
+            all_vulns.extend(xxe_vulns)
+            if xxe_vulns:
+                print_warn(f"XXE: {len(xxe_vulns)} hallazgos")
+
+            # YAML Engine (Nuclei-style)
+            yaml_vulns = await yaml_engine.run(client, url)
+            all_vulns.extend(yaml_vulns)
+            if yaml_vulns:
+                print_warn(f"YAML Templates: {len(yaml_vulns)} hallazgos")
+
+            total_active = len(ssti_vulns) + len(active_vulns) + len(form_vulns) + len(gql_vulns) + len(xxe_vulns) + len(yaml_vulns)
+            if total_active > 0:
+                print_warn(f"Activo: {total_active} hallazgos en total")
             else:
                 print_ok("Sin vulnerabilidades activas detectadas")
         else:
             print_section("10/10", "Escaneo Activo [OMITIDO]")
+
+    finally:
+        try:
+            await session.close()
+        except AttributeError:
+            pass  # Bug de aiohttp en Windows al cerrar conexiones SSL ya liberadas
 
     duration = time.monotonic() - t0
     deduped  = deduplicate(all_vulns)

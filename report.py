@@ -12,6 +12,14 @@ from utils.vuln import Vuln, count_by_severity, risk_score
 from utils.colors import sev_bg
 from config import VERSION
 
+try:
+    from weasyprint import HTML
+    WEASYPRINT_AVAILABLE = True
+    WEASYPRINT_ERROR = None
+except Exception as e:
+    WEASYPRINT_AVAILABLE = False
+    WEASYPRINT_ERROR = str(e)
+
 
 def generate_json(
     url:       str,
@@ -269,3 +277,50 @@ def generate_html(
 </footer>
 </body>
 </html>"""
+
+
+def generate_pdf(
+    url:      str,
+    vulns:    list[Vuln],
+    meta:     dict,
+    duration: float,
+    output_path: str
+) -> bool:
+    """Genera un reporte PDF ejecutivo utilizando WeasyPrint."""
+    if not WEASYPRINT_AVAILABLE:
+        raise RuntimeError(
+            f"WeasyPrint no está disponible. Error de carga: {WEASYPRINT_ERROR}. "
+            "En Windows, WeasyPrint requiere que instales las librerías GTK3 de sistema "
+            "(GTK3-Runtime). Para más info visita: https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows"
+        )
+
+    # Reutilizamos el HTML pero le inyectamos un estilo optimizado para impresión (PDF)
+    # Fondo blanco, texto negro, sin estilos dark mode para que se vea formal.
+    html_content = generate_html(url, vulns, meta, duration)
+    
+    # Reemplazar estilos oscuros por estilos claros y formales para PDF
+    html_content = html_content.replace("background:#0d1117", "background:#ffffff")
+    html_content = html_content.replace("color:#c9d1d9", "color:#333333")
+    html_content = html_content.replace("background:#161b22", "background:#f8f9fa")
+    html_content = html_content.replace("border:1px solid #21262d", "border:1px solid #dee2e6")
+    html_content = html_content.replace("color:#58a6ff", "color:#0056b3")
+    html_content = html_content.replace("color:#8b949e", "color:#6c757d")
+    html_content = html_content.replace("background:linear-gradient(135deg,#1a1f2e 0%,#0d1117 100%)", "background:#f8f9fa")
+    
+    # Añadir CSS de paginación para que no corte filas
+    pdf_styles = """
+    <style>
+      @page { size: A4; margin: 2cm; }
+      table { page-break-inside: auto; }
+      tr    { page-break-inside: avoid; page-break-after: auto; }
+      thead { display: table-header-group; }
+      tfoot { display: table-footer-group; }
+      body  { font-size: 12px; }
+      .header h1 { color: #000; }
+    </style>
+    """
+    html_content = html_content.replace("</head>", f"{pdf_styles}</head>")
+
+    HTML(string=html_content).write_pdf(output_path)
+    return True
+

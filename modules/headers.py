@@ -1,5 +1,11 @@
 """
 modules/headers.py — Análisis de security headers, CORS, cookies y CSP.
+
+Anti-falsos-positivos:
+  - CSP wildcard '*': solo se reporta si aparece como valor standalone en una
+    directiva (ej: `script-src *`), no si es parte de un dominio (*.example.com).
+  - EOL + versión exacta: si ya se reportó un vuln EOL para el mismo server string,
+    no se añade el vuln informativo de "versión exacta expuesta" (redundante).
 """
 
 from __future__ import annotations
@@ -48,18 +54,25 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
     csp = h.get("content-security-policy", "")
     if csp:
         for directive, sev, cvss, desc in CSP_INSECURE:
-            if directive in csp:
-                vulns.append(make_vuln(
-                    title       = f"CSP insegura: '{directive}'",
-                    severity    = sev,
-                    cvss        = cvss,
-                    category    = "Content-Security-Policy",
-                    description = desc,
-                    evidence    = f"CSP: {csp[:150]}",
-                    fix         = f"Eliminar '{directive}' de la directiva CSP.",
-                    ref         = "https://csp-evaluator.withgoogle.com/",
-                    module      = "headers",
-                ))
+            if directive == "*":
+                # Solo reportar si '*' es un valor standalone (no *.example.com)
+                # Busca: whitespace|inicio + * + whitespace|;|fin
+                if not re.search(r"(?:^|[\s])\*(?=[\s;]|$)", csp):
+                    continue
+            else:
+                if directive not in csp:
+                    continue
+            vulns.append(make_vuln(
+                title       = f"CSP insegura: '{directive}'",
+                severity    = sev,
+                cvss        = cvss,
+                category    = "Content-Security-Policy",
+                description = desc,
+                evidence    = f"CSP: {csp[:150]}",
+                fix         = f"Eliminar '{directive}' de la directiva CSP.",
+                ref         = "https://csp-evaluator.withgoogle.com/",
+                module      = "headers",
+            ))
 
     # ── HSTS análisis profundo ─────────────────────────────────────────────────
     hsts = h.get("strict-transport-security", "")
@@ -157,8 +170,10 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
     powered = h.get("x-powered-by", "")
     all_fp  = f"{server} {powered}".strip()
 
+    eol_found = False
     for sig, (sev, cvss, desc) in EOL_SIGNATURES.items():
         if sig.lower() in all_fp.lower():
+            eol_found = True
             vulns.append(make_vuln(
                 f"Software EOL: {sig}", sev, cvss, "Version Disclosure",
                 f"{desc}. Software sin soporte de seguridad activo.",
@@ -168,7 +183,8 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
                 module="headers",
             ))
 
-    if server and server.lower() not in ("cloudflare", "", "nginx", "apache"):
+    # Solo reportar 'versión exacta expuesta' si NO hay un vuln EOL ya (evita duplicado)
+    if not eol_found and server and server.lower() not in ("cloudflare", "", "nginx", "apache"):
         vulns.append(make_vuln(
             "Versión exacta del servidor expuesta", "MEDIUM", 5.3, "Information Disclosure",
             "Revelar la versión exacta permite buscar CVEs específicos.",
