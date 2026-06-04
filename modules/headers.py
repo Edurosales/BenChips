@@ -2,10 +2,13 @@
 modules/headers.py — Análisis de security headers, CORS, cookies y CSP.
 
 Anti-falsos-positivos:
-  - CSP wildcard '*': solo se reporta si aparece como valor standalone en una
-    directiva (ej: `script-src *`), no si es parte de un dominio (*.example.com).
-  - EOL + versión exacta: si ya se reportó un vuln EOL para el mismo server string,
-    no se añade el vuln informativo de "versión exacta expuesta" (redundante).
+  - Context-aware: headers HTML-only (CSP, X-Frame-Options, Referrer-Policy) se omiten
+    para endpoints JSON/XML — no son aplicables a APIs sin respuesta HTML.
+  - CORS *: solo HIGH si hay Allow-Credentials:true. Sin credentials es MEDIUM (intencional
+    en APIs públicas). Solo CRITICAL cuando refleja origen arbitrario + credentials.
+  - Cookies: se omiten cookies de tracking/analytics (_ga, _gid, etc.) — no son sesión.
+  - CSP wildcard '*': solo reporta si aparece como valor standalone, no en *.example.com.
+  - EOL + versión exacta: sin duplicar si ya hay un vuln EOL para el mismo server string.
 """
 
 from __future__ import annotations
@@ -16,6 +19,23 @@ from typing import Optional
 from utils.http import AsyncHTTPClient, Response
 from utils.vuln import Vuln, make_vuln
 from config import SECURITY_HEADERS, CSP_INSECURE, EOL_SIGNATURES
+
+# Headers que solo tienen sentido en respuestas HTML (no en APIs JSON/XML)
+_HTML_ONLY_HEADERS = frozenset([
+    "content-security-policy",
+    "x-frame-options",
+    "referrer-policy",
+])
+
+# Prefijos de cookies de tracking/analytics — no son cookies de sesión
+_TRACKING_PREFIXES = (
+    "_ga", "_gid", "_gat", "_fbp", "_fbc", "_gcl",
+    "__utm", "ajs_", "mp_", "_hjid", "_ym_", "intercom-",
+)
+
+def _is_tracking_cookie(raw_cookie: str) -> bool:
+    name = raw_cookie.split("=")[0].strip().lower()
+    return name.startswith(_TRACKING_PREFIXES)
 
 
 async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response | None]:
@@ -35,8 +55,20 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
 
     h = resp.headers  # ya en minúsculas
 
+    # Detectar si este endpoint es una API (JSON/XML) o retorna HTML
+    content_type = h.get("content-type", "").lower()
+    is_api = (
+        "application/json" in content_type
+        or "application/xml" in content_type
+        or "text/xml" in content_type
+        or "application/graphql" in content_type
+    )
+
     # ── Security Headers faltantes ─────────────────────────────────────────────
     for header, meta in SECURITY_HEADERS.items():
+        # Headers HTML-only no aplican a endpoints que devuelven JSON/XML puro
+        if is_api and header.lower() in _HTML_ONLY_HEADERS:
+            continue
         if header.lower() not in h:
             vulns.append(make_vuln(
                 title       = f"Header faltante: {header}",
@@ -104,6 +136,11 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
             cookies_raw.append(v)
 
     for cookie in cookies_raw:
+        # Omitir cookies de tracking/analytics — no son cookies de sesión y
+        # reportarlas como MEDIUM genera ruido que desacredita el informe
+        if _is_tracking_cookie(cookie):
+            continue
+
         cl = cookie.lower()
         if "httponly" not in cl:
             vulns.append(make_vuln(
@@ -135,15 +172,34 @@ async def run(client: AsyncHTTPClient, url: str) -> tuple[list[Vuln], Response |
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors = h.get("access-control-allow-origin", "")
     if cors == "*":
-        vulns.append(make_vuln(
-            "CORS abierto: Access-Control-Allow-Origin: *",
-            "HIGH", 7.5, "CORS Misconfiguration",
-            "Cualquier dominio puede hacer peticiones cross-origin a esta API.",
-            "Access-Control-Allow-Origin: *",
-            "Especificar dominios explícitos: Access-Control-Allow-Origin: https://tudominio.com",
-            ref="https://portswigger.net/web-security/cors",
-            module="headers",
-        ))
+        creds = h.get("access-control-allow-credentials", "")
+        if "true" in creds.lower():
+            # CORS * + credentials = configuración imposible según spec, pero algunos
+            # servidores mal configurados la aceptan — muy peligroso
+            vulns.append(make_vuln(
+                "CORS * con Allow-Credentials: true",
+                "CRITICAL", 9.1, "CORS Misconfiguration",
+                "CORS wildcard con credenciales permitidas permite a cualquier sitio leer "
+                "respuestas autenticadas del usuario (cookies, tokens).",
+                f"Access-Control-Allow-Origin: *\nAccess-Control-Allow-Credentials: {creds}",
+                "Nunca combinar ACAO:* con ACAC:true. Usar lista blanca explícita de orígenes.",
+                ref="https://portswigger.net/web-security/cors",
+                module="headers",
+            ))
+        else:
+            # Sin credentials, CORS * es intencional en APIs públicas — MEDIUM, no HIGH
+            vulns.append(make_vuln(
+                "CORS permisivo: Access-Control-Allow-Origin: *",
+                "MEDIUM", 5.3, "CORS Misconfiguration",
+                "Cualquier origen puede leer respuestas de esta API. "
+                "Impacto real depende de si los endpoints retornan datos sensibles sin autenticación. "
+                "Verificar si la API sirve datos autenticados antes de reportar.",
+                "Access-Control-Allow-Origin: *",
+                "Limitar a orígenes específicos si la API maneja datos de usuario. "
+                "Para APIs públicas de solo lectura, CORS:* puede ser intencional.",
+                ref="https://portswigger.net/web-security/cors",
+                module="headers",
+            ))
     elif cors and cors not in ("null", ""):
         resp2 = await client.get(
             url, extra_headers={"Origin": "https://evil.attacker.com"}, lax_ssl=True

@@ -35,6 +35,8 @@ async def run(
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
 
+    using_real_params = bool(params)
+
     # Si hay parámetros en la URL real, usarlos; sino, probar comunes
     probe_params = list(params.keys()) if params else [
         "q", "search", "id", "page", "name", "msg", "text",
@@ -44,6 +46,27 @@ async def run(
     # Limitar para no ralentizar demasiado en modo no-full
     max_params = 8 if full_scan else 4
     probe_params = probe_params[:max_params]
+
+    # ── Canary check para parámetros inventados ────────────────────────────────
+    # Si no hay params reales en la URL, verificar cuáles SÍ afectan el output
+    # antes de probar SSTI. Evita FPs donde el servidor ignora el parámetro y
+    # "49" aparece en el contenido por otra razón (precio, contador, ID).
+    if not using_real_params:
+        active_params: list[str] = []
+        for param in probe_params:
+            r1 = await client.get(
+                _inject(url, parsed, param, "CANARY_ALPHA_XQ9"),
+                follow=True, lax_ssl=True, body_limit=16384,
+            )
+            r2 = await client.get(
+                _inject(url, parsed, param, "CANARY_BETA_ZW8"),
+                follow=True, lax_ssl=True, body_limit=16384,
+            )
+            if r1 and r2 and r1.body != r2.body:
+                active_params.append(param)  # El servidor sí usa este param
+        probe_params = active_params
+        if not probe_params:
+            return []  # Ningún param inventado afecta el output — no hay superficie SSTI
 
     # Concurrencia baja — sigiloso
     sem = asyncio.Semaphore(3)

@@ -15,7 +15,7 @@ from utils.http import AsyncHTTPClient, create_session
 from utils.vuln import deduplicate, Vuln
 from utils.colors import (
     print_section, print_ok, print_warn, print_err, print_info,
-    print_vuln, progress_bar, print_sep, sev_color, W, BOLD, C, G, O, DIM
+    print_vuln, progress_bar, print_sep, sev_color, W, BOLD, C, G, O, DIM, spinner_async
 )
 
 from modules import recon, headers, ssl_tls, http_methods, paths, ports, redirects, waf, content, active, api_discovery, js_cve, ssti, admin_panels, forms, jwt_scan, graphql, xxe, yaml_engine
@@ -28,6 +28,8 @@ async def scan(
     active_scan: bool = False,
     no_color:    bool = False,
     stealth:     bool = False,
+    auth_config  = None,      # utils.auth.AuthConfig | None
+    use_oob:     bool = True, # intentar OOB con interactsh
 ) -> tuple[list[Vuln], dict, float]:
     """
     Ejecuta el escaneo completo de forma async.
@@ -53,8 +55,10 @@ async def scan(
         "ports":        [],
         "paths":        [],
         "api_endpoints":[],
+        "crawled_urls": [],    # URLs descubiertas por el crawler
         "server":       "",    # Server header
         "powered_by":   "",    # X-Powered-By header
+        "auth":         bool(auth_config),  # si se usó autenticación
     }
 
     all_vulns: list[Vuln] = []
@@ -65,11 +69,29 @@ async def scan(
     )
     session = aiohttp.ClientSession(connector=connector)
     try:
-        client = AsyncHTTPClient(session, rate_limit=20, timeout=10, stealth=stealth)
+        auth_headers = auth_config.to_headers() if auth_config else {}
+        client = AsyncHTTPClient(
+            session, rate_limit=20, timeout=10,
+            stealth=stealth, auth_headers=auth_headers,
+        )
+
+        # ── OOB client (interactsh) ───────────────────────────────────────────
+        oob_client = None
+        if use_oob and active_scan:
+            from utils.oob import OOBClient
+            oob_client = OOBClient()
+            registered, oob_error = await oob_client.register(session)
+            if registered:
+                print_ok(f"OOB activo: {oob_client.correlation_id[:8]}...@{oob_client.server} (SSRF ciego confirmable)")
+            else:
+                print_info(f"OOB desactivado: {oob_error}")
+                print_info("  SSRF se detectará por indicadores en respuesta (sin callback)")
+                oob_client = None
 
         # ── 1. WAF Detection ──────────────────────────────────────────────────
         print_section("1/9", "WAF / CDN Detection")
-        waf_vulns, waf_info = await waf.run(client, url, hostname)
+        async with spinner_async("Detectando WAF"):
+            waf_vulns, waf_info = await waf.run(client, url, hostname)
         all_vulns.extend(waf_vulns)
         meta["waf"]           = waf_info.get("waf")
         meta["real_ip_hints"] = waf_info.get("real_ip_hints", [])
@@ -80,7 +102,8 @@ async def scan(
 
         # ── 2. Recon ──────────────────────────────────────────────────────────
         print_section("2/9", "Reconocimiento DNS / Subdominios")
-        recon_vulns, recon_info = await recon.run(client, url, hostname, full_scan=full_scan)
+        async with spinner_async("Reconocimiento en progreso"):
+            recon_vulns, recon_info = await recon.run(client, url, hostname, full_scan=full_scan)
         all_vulns.extend(recon_vulns)
         meta["ips"]          = recon_info.get("ips", [])
         meta["ipv6"]         = recon_info.get("ipv6", [])
@@ -93,12 +116,39 @@ async def scan(
         if meta["technologies"]:
             print_ok(f"Tecnologías: {', '.join(meta['technologies'])}")
         if meta["subdomains"]:
-            print_ok(f"Subdominios: {len(meta['subdomains'])} encontrados")
+            print_ok(f"Subdominios: {len(meta['subdomains'])} encontrados (crt.sh + HackerTarget + AlienVault + CertSpotter + wordlist)")
+
+        # ── 2.3. Escaneo de subdominios ───────────────────────────────────────
+        if full_scan and meta["subdomains"]:
+            print_section("Subs", f"Escaneando subdominios ({min(len(meta['subdomains']),12)} de {len(meta['subdomains'])})")
+            sub_vulns = await _scan_subdomains(
+                client, meta["subdomains"], scheme, max_subs=12
+            )
+            all_vulns.extend(sub_vulns)
+            if sub_vulns:
+                print_warn(f"{len(sub_vulns)} hallazgos en subdominios")
+            else:
+                print_ok("Sin hallazgos críticos en subdominios")
+
+        # ── 2.5. Crawler ──────────────────────────────────────────────────────
+        crawled_urls: list[str] = []
+        print_section("Crawler", "Descubrimiento de endpoints")
+        max_pages = 100 if full_scan else 50
+        async with spinner_async(f"Crawleando (max {max_pages} páginas)"):
+            from utils.crawler import crawl
+            crawled_urls = await crawl(client, url, max_pages=max_pages, max_depth=2)
+        meta["crawled_urls"] = crawled_urls
+        n_crawled = len(crawled_urls)
+        if n_crawled > 1:
+            print_ok(f"{n_crawled} URLs descubiertas en el sitio")
+        else:
+            print_info("Crawler: solo la URL raíz accesible")
 
         # ── 3. SSL/TLS ────────────────────────────────────────────────────────
         print_section("3/9", "SSL / TLS")
         ssl_port = 443 if ":" not in hostname else int(hostname.split(":")[1])
-        ssl_vulns, ssl_info = await ssl_tls.run(hostname.split(":")[0], port=ssl_port)
+        async with spinner_async("Analizando certificados"):
+            ssl_vulns, ssl_info = await ssl_tls.run(hostname.split(":")[0], port=ssl_port)
         all_vulns.extend(ssl_vulns)
         meta["ssl"] = ssl_info
         if ssl_info:
@@ -110,7 +160,8 @@ async def scan(
 
         # ── 4. Security Headers ───────────────────────────────────────────────
         print_section("4/9", "Security Headers / CORS / Cookies")
-        hdr_vulns, main_resp = await headers.run(client, url)
+        async with spinner_async("Verificando cabeceras"):
+            hdr_vulns, main_resp = await headers.run(client, url)
         all_vulns.extend(hdr_vulns)
         n_missing = sum(1 for v in hdr_vulns if "faltante" in v.title.lower())
         # Capturar Server y X-Powered-By del response
@@ -125,7 +176,8 @@ async def scan(
 
         # ── 5. HTTP Methods ───────────────────────────────────────────────────
         print_section("5/9", "HTTP Methods peligrosos")
-        method_vulns = await http_methods.run(client, url)
+        async with spinner_async("Comprobando métodos"):
+            method_vulns = await http_methods.run(client, url)
         all_vulns.extend(method_vulns)
         if method_vulns:
             dangerous = [v.title for v in method_vulns]
@@ -135,7 +187,8 @@ async def scan(
 
         # ── 5.5. Admin Panels ─────────────────────────────────────────────────
         print_section("Admin", "Paneles de Administración")
-        admin_vulns, admin_data = await admin_panels.run(client, url, technologies=meta.get("technologies", []))
+        async with spinner_async("Buscando paneles"):
+            admin_vulns, admin_data = await admin_panels.run(client, url, technologies=meta.get("technologies", []))
         all_vulns.extend(admin_vulns)
         meta["admin_panels"] = admin_data
         exposed = [p for p in admin_data if p.get("login")]
@@ -151,7 +204,8 @@ async def scan(
         # Usamos la lista de config
         from config import SENSITIVE_PATHS as SP
         print_info(f"Escaneando {len(SP)} rutas...")
-        path_vulns, found_paths = await paths.run(client, url)
+        async with spinner_async("Escaneando rutas"):
+            path_vulns, found_paths = await paths.run(client, url)
         all_vulns.extend(path_vulns)
         meta["paths"] = found_paths
         if found_paths:
@@ -182,12 +236,14 @@ async def scan(
 
         # ── 8. Open Redirect ──────────────────────────────────────────────────
         print_section("8/9", "Open Redirect / Content Leakage")
-        redir_vulns  = await redirects.run(client, url)
+        async with spinner_async("Analizando redirect"):
+            redir_vulns  = await redirects.run(client, url)
         all_vulns.extend(redir_vulns)
 
         # Content leakage usa el body ya obtenido si está disponible
         body_text = main_resp.text if main_resp else None
-        content_vulns = await content.run(client, url, resp_body=body_text)
+        async with spinner_async("Buscando content leakage"):
+            content_vulns = await content.run(client, url, resp_body=body_text)
         all_vulns.extend(content_vulns)
 
         if redir_vulns:
@@ -199,7 +255,8 @@ async def scan(
 
         # ── 8.5. JS Vulnerable Libraries ──────────────────────────────────────
         print_section("JS", "Librerías JavaScript Vulnerables")
-        js_vulns = await js_cve.run(client, url, body_text)
+        async with spinner_async("Analizando JS"):
+            js_vulns = await js_cve.run(client, url, body_text)
         all_vulns.extend(js_vulns)
         if js_vulns:
             print_warn(f"[{len(js_vulns)}] Librerías vulnerables (CVEs detectados)")
@@ -208,7 +265,8 @@ async def scan(
 
         # ── 8.8. JWT Analysis ─────────────────────────────────────────────────
         print_section("JWT", "Análisis de Tokens JWT")
-        jwt_vulns = await jwt_scan.run(client, url, body_text=body_text, headers=main_resp.headers if main_resp else None)
+        async with spinner_async("Inspeccionando JWT"):
+            jwt_vulns = await jwt_scan.run(client, url, body_text=body_text, headers=main_resp.headers if main_resp else None)
         all_vulns.extend(jwt_vulns)
         if jwt_vulns:
             print_warn(f"[{len(jwt_vulns)}] Vulnerabilidades en JWT encontradas")
@@ -217,7 +275,8 @@ async def scan(
 
         # ── 9. API & Endpoint Discovery ───────────────────────────────────────
         print_section("9/10", "Descubrimiento de API & Endpoints")
-        api_vulns, api_data = await api_discovery.run(client, url, body_text)
+        async with spinner_async("Descubriendo endpoints"):
+            api_vulns, api_data = await api_discovery.run(client, url, body_text)
         all_vulns.extend(api_vulns)
         meta["api_endpoints"] = api_data
         apis = [e for e in api_data if e["type"] == "api"]
@@ -231,35 +290,46 @@ async def scan(
             print_section("10/10", "Escaneo Activo (SQLi / SSTI / XSS / Traversal / SSRF)")
             
             # SSTI
-            ssti_vulns = await ssti.run(client, url, full_scan=full_scan)
+            async with spinner_async("Probando SSTI"):
+                ssti_vulns = await ssti.run(client, url, full_scan=full_scan)
             all_vulns.extend(ssti_vulns)
             if ssti_vulns:
                 print_warn(f"SSTI: {len(ssti_vulns)} hallazgos")
                 
-            # Resto de activos
-            active_vulns = await active.run(client, url, full_scan=full_scan)
+            # Resto de activos (SQLi, XSS, Traversal, SSRF, JSON injection)
+            async with spinner_async("Escaneo activo (Inyecciones, etc)"):
+                active_vulns = await active.run(
+                    client, url,
+                    full_scan  = full_scan,
+                    oob        = oob_client,
+                    extra_urls = crawled_urls[1:] if crawled_urls else [],
+                )
             all_vulns.extend(active_vulns)
             
             # Forms
-            form_vulns = await forms.run(client, url, body_text=body_text)
+            async with spinner_async("Probando formularios"):
+                form_vulns = await forms.run(client, url, body_text=body_text)
             all_vulns.extend(form_vulns)
             if form_vulns:
                 print_warn(f"Forms: {len(form_vulns)} hallazgos")
 
             # GraphQL
-            gql_vulns = await graphql.run(client, url)
+            async with spinner_async("Escaneando GraphQL"):
+                gql_vulns = await graphql.run(client, url)
             all_vulns.extend(gql_vulns)
             if gql_vulns:
                 print_warn(f"GraphQL: {len(gql_vulns)} hallazgos")
 
             # XXE
-            xxe_vulns = await xxe.run(client, url, api_endpoints=meta.get("api_endpoints", []))
+            async with spinner_async("Probando XXE"):
+                xxe_vulns = await xxe.run(client, url, api_endpoints=meta.get("api_endpoints", []))
             all_vulns.extend(xxe_vulns)
             if xxe_vulns:
                 print_warn(f"XXE: {len(xxe_vulns)} hallazgos")
 
             # YAML Engine (Nuclei-style)
-            yaml_vulns = await yaml_engine.run(client, url)
+            async with spinner_async("Ejecutando firmas Nuclei"):
+                yaml_vulns = await yaml_engine.run(client, url)
             all_vulns.extend(yaml_vulns)
             if yaml_vulns:
                 print_warn(f"YAML Templates: {len(yaml_vulns)} hallazgos")
@@ -281,3 +351,48 @@ async def scan(
     duration = time.monotonic() - t0
     deduped  = deduplicate(all_vulns)
     return deduped, meta, duration
+
+
+# ─── Subdomain scanner ────────────────────────────────────────────────────────
+
+async def _scan_subdomains(
+    client: AsyncHTTPClient,
+    subdomains: list[str],
+    scheme: str = "https",
+    max_subs: int = 12,
+) -> list[Vuln]:
+    """
+    Aplica headers + SSL + paths sensibles a los subdominios descubiertos.
+    Solo escaneamos los primeros max_subs para no tardar demasiado.
+    """
+    vulns: list[Vuln] = []
+    sem = asyncio.Semaphore(4)  # máx. 4 subdominios en paralelo
+
+    async def scan_one(sub: str):
+        sub_url = f"{scheme}://{sub}"
+        async with sem:
+            # Headers de seguridad
+            try:
+                hdr_vulns, _ = await headers.run(client, sub_url)
+                # Solo reportar MEDIUM o superior para no generar ruido
+                for v in hdr_vulns:
+                    if v.severity in ("CRITICAL", "HIGH", "MEDIUM"):
+                        v.title = f"[{sub}] {v.title}"
+                        v.url   = sub_url
+                        vulns.append(v)
+            except Exception:
+                pass
+
+            # Paths sensibles rápidos (solo los más críticos)
+            try:
+                path_vulns, _ = await paths.run(client, sub_url)
+                for v in path_vulns:
+                    if v.severity in ("CRITICAL", "HIGH"):
+                        v.title = f"[{sub}] {v.title}"
+                        v.url   = sub_url
+                        vulns.append(v)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[scan_one(s) for s in subdomains[:max_subs]])
+    return vulns

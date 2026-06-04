@@ -87,12 +87,24 @@ async def run(
         techs = _detect_technologies(resp.text, resp.headers)
         info["technologies"] = techs
 
-    # ── Subdominios ────────────────────────────────────────────────────────────
+    # ── Subdominios (multi-fuente) ─────────────────────────────────────────────
     if full_scan:
-        crt_subs = await _crtsh_subdomains(client, hostname)
-        wl_subs  = await _wordlist_subdomains(hostname, loop)
+        # Ejecutar todas las fuentes en paralelo
+        results = await asyncio.gather(
+            _crtsh_subdomains(client, hostname),
+            _hackertarget_subdomains(client, hostname),
+            _alienvault_subdomains(client, hostname),
+            _certspotter_subdomains(client, hostname),
+            _wordlist_subdomains(hostname, loop),
+            return_exceptions=True,
+        )
 
-        all_subs = sorted(set(crt_subs) | set(wl_subs))
+        merged: set[str] = set()
+        for r in results:
+            if isinstance(r, list):
+                merged.update(r)
+
+        all_subs = sorted(merged)
         info["subdomains"] = all_subs
 
         if all_subs:
@@ -102,10 +114,10 @@ async def run(
                 cvss        = 0.0,
                 category    = "Recon",
                 description = (
-                    f"Se encontraron {len(all_subs)} subdominios. Cada uno amplía la superficie de ataque. "
-                    "Revisar si alguno expone servicios internos o paneles admin."
+                    f"Se encontraron {len(all_subs)} subdominios activos (crt.sh + HackerTarget + "
+                    f"AlienVault + CertSpotter + wordlist). Cada uno amplía la superficie de ataque."
                 ),
-                evidence    = ", ".join(all_subs[:10]) + ("..." if len(all_subs) > 10 else ""),
+                evidence    = ", ".join(all_subs[:15]) + ("..." if len(all_subs) > 15 else ""),
                 fix         = "Auditar cada subdominio. Eliminar o proteger los que no deban ser públicos.",
                 ref         = "https://owasp.org/www-project-web-security-testing-guide/",
                 module      = "recon",
@@ -117,7 +129,7 @@ async def run(
     return vulns, info
 
 
-# ─── crt.sh ───────────────────────────────────────────────────────────────────
+# ─── Fuentes de subdominios ────────────────────────────────────────────────────
 
 async def _crtsh_subdomains(client: AsyncHTTPClient, hostname: str) -> list[str]:
     """Consulta Certificate Transparency logs via crt.sh."""
@@ -131,6 +143,69 @@ async def _crtsh_subdomains(client: AsyncHTTPClient, hostname: str) -> list[str]
         subs = set()
         for entry in data:
             for name in entry.get("name_value", "").split("\n"):
+                name = name.strip().lstrip("*.")
+                if name.endswith(f".{hostname}") and name != hostname:
+                    subs.add(name)
+        return sorted(subs)
+    except Exception:
+        return []
+
+
+async def _hackertarget_subdomains(client: AsyncHTTPClient, hostname: str) -> list[str]:
+    """HackerTarget hostsearch API — gratuita, no requiere API key."""
+    try:
+        resp = await client.get(
+            f"https://api.hackertarget.com/hostsearch/?q={hostname}",
+            lax_ssl=True,
+        )
+        if not resp or resp.status != 200:
+            return []
+        subs = set()
+        for line in resp.text.splitlines():
+            parts = line.split(",")
+            if parts:
+                sub = parts[0].strip().lstrip("*.")
+                if sub.endswith(f".{hostname}") and sub != hostname:
+                    subs.add(sub)
+        return sorted(subs)
+    except Exception:
+        return []
+
+
+async def _alienvault_subdomains(client: AsyncHTTPClient, hostname: str) -> list[str]:
+    """AlienVault OTX — gratuita, sin API key para passive DNS."""
+    try:
+        resp = await client.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{hostname}/passive_dns",
+            lax_ssl=True,
+        )
+        if not resp or resp.status != 200:
+            return []
+        data = json.loads(resp.text)
+        subs = set()
+        for entry in data.get("passive_dns", []):
+            hostname_val = entry.get("hostname", "")
+            if hostname_val.endswith(f".{hostname}") and hostname_val != hostname:
+                subs.add(hostname_val.lstrip("*."))
+        return sorted(subs)
+    except Exception:
+        return []
+
+
+async def _certspotter_subdomains(client: AsyncHTTPClient, hostname: str) -> list[str]:
+    """CertSpotter certificate transparency — gratuita sin API key (rate limited)."""
+    try:
+        resp = await client.get(
+            f"https://api.certspotter.com/v1/issuances?domain={hostname}"
+            f"&include_subdomains=true&expand=dns_names",
+            lax_ssl=True,
+        )
+        if not resp or resp.status != 200:
+            return []
+        data = json.loads(resp.text)
+        subs = set()
+        for entry in data:
+            for name in entry.get("dns_names", []):
                 name = name.strip().lstrip("*.")
                 if name.endswith(f".{hostname}") and name != hostname:
                     subs.add(name)

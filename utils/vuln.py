@@ -31,7 +31,9 @@ class Vuln:
 
     @property
     def dedup_key(self) -> str:
-        raw = f"{self.category}:{self.title[:60]}"
+        from urllib.parse import urlparse
+        path = urlparse(self.url).path.rstrip("/") if self.url else ""
+        raw = f"{self.category}:{self.title[:60]}:{path}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def to_dict(self) -> dict:

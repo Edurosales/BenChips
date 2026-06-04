@@ -82,6 +82,7 @@ class AsyncHTTPClient:
         timeout:      int  = 8,
         max_retries:  int  = 2,
         stealth:      bool = False,
+        auth_headers: Optional[dict] = None,
     ):
         self.session     = session
         self.semaphore   = asyncio.Semaphore(rate_limit)
@@ -89,6 +90,7 @@ class AsyncHTTPClient:
         self.max_retries = max_retries
         self.stealth     = stealth
         self.baselines:  dict[str, Baseline] = {}
+        self._auth_headers: dict = auth_headers or {}
 
         # Headers base (no-stealth)
         self._base_headers = {
@@ -106,6 +108,10 @@ class AsyncHTTPClient:
             hdrs["User-Agent"] = ua
         else:
             hdrs = dict(self._base_headers)
+
+        # Auth headers se incluyen en TODAS las peticiones (autenticación persistente)
+        if self._auth_headers:
+            hdrs.update(self._auth_headers)
 
         if extra:
             hdrs.update(extra)
@@ -168,6 +174,68 @@ class AsyncHTTPClient:
 
     async def method_req(self, method: str, url: str, **kwargs) -> Optional[Response]:
         return await self.request(method, url, **kwargs)
+
+    async def post_json(
+        self,
+        url: str,
+        body: dict,
+        extra_headers: Optional[dict] = None,
+        body_limit: int = 65536,
+    ) -> Optional[Response]:
+        """POST con body JSON. Incluye auth_headers automáticamente."""
+        import json as _json
+        hdrs = self._build_headers(extra_headers)
+        hdrs["Content-Type"] = "application/json"
+        ssl_ctx = False
+
+        for attempt in range(self.max_retries + 1):
+            async with self.semaphore:
+                try:
+                    async with self.session.post(
+                        url,
+                        data=_json.dumps(body),
+                        headers=hdrs,
+                        ssl=ssl_ctx,
+                        allow_redirects=True,
+                        timeout=self.timeout,
+                    ) as r:
+                        data = await r.read()
+                        return Response(r.status, dict(r.headers), data[:body_limit], str(r.url))
+                except Exception:
+                    pass
+                if attempt < self.max_retries:
+                    await asyncio.sleep(2 ** attempt * 0.5)
+        return None
+
+    async def post_form(
+        self,
+        url: str,
+        data: dict,
+        extra_headers: Optional[dict] = None,
+        body_limit: int = 65536,
+    ) -> Optional[Response]:
+        """POST con body urlencoded. Incluye auth_headers automáticamente."""
+        hdrs = self._build_headers(extra_headers)
+        ssl_ctx = False
+
+        for attempt in range(self.max_retries + 1):
+            async with self.semaphore:
+                try:
+                    async with self.session.post(
+                        url,
+                        data=data,
+                        headers=hdrs,
+                        ssl=ssl_ctx,
+                        allow_redirects=True,
+                        timeout=self.timeout,
+                    ) as r:
+                        raw = await r.read()
+                        return Response(r.status, dict(r.headers), raw[:body_limit], str(r.url))
+                except Exception:
+                    pass
+                if attempt < self.max_retries:
+                    await asyncio.sleep(2 ** attempt * 0.5)
+        return None
 
     async def establish_baseline(self, base_url: str) -> None:
         """Hace 2 peticiones a rutas aleatorias para fingerprint el comportamiento 404."""

@@ -4,3 +4,19 @@ __pycache__/
 reports/
 .env
 venv/
+env/
+
+# Configuración local con credenciales — NUNCA commitear
+.ai_config.json
+*.ai_config.json
+
+# Archivos de test con credenciales hardcodeadas
+test_groq_model.py
+test_groq_model2.py
+test_*.py
+
+# Otros archivos sensibles
+*.key
+*.pem
+secrets.json
+credentials.json

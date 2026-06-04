@@ -26,6 +26,7 @@ def disable_color():
     global R, O, Y, G, B, M, C, W, BOLD, DIM, UL, BG, _COLOR_ENABLED
     R=O=Y=G=B=M=C=W=BOLD=DIM=UL=BG=""
     _COLOR_ENABLED = False
+    return R, O, Y, G, B, M, C, W, BOLD, DIM, UL, BG
 
 
 def sev_color(s: str) -> str:
@@ -104,14 +105,50 @@ def progress_bar(done: int, total: int, label: str = ""):
     print(f"\r  {C}[{bar}]{W} {perc:3d}%  {DIM}{label:<40}{W}", end="", flush=True)
 
 
+import asyncio
+import contextlib
+
+@contextlib.asynccontextmanager
+async def spinner_async(message: str):
+    idx = 0
+    chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    
+    async def _spin():
+        nonlocal idx
+        try:
+            while True:
+                c = chars[idx % len(chars)]
+                sys.stdout.write(f"\r  {C}{c}{W}  {DIM}{message}...{W}")
+                sys.stdout.flush()
+                idx += 1
+                await asyncio.sleep(0.08)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_spin())
+    try:
+        yield
+    finally:
+        task.cancel()
+        # Limpiar la línea
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+
 def banner(version: str):
     print(f"""
 {C}{BOLD}
- ██╗   ██╗██╗   ██╗██╗     ███╗   ██╗███████╗ ██████╗ █████╗ ███╗   ██╗
- ██║   ██║██║   ██║██║     ████╗  ██║██╔════╝██╔════╝██╔══██╗████╗  ██║
- ██║   ██║██║   ██║██║     ██╔██╗ ██║███████╗██║     ███████║██╔██╗ ██║
- ╚██╗ ██╔╝██║   ██║██║     ██║╚██╗██║╚════██║██║     ██╔══██║██║╚██╗██║
-  ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║███████║╚██████╗██║  ██║██║ ╚████║
-   ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
-{W}{BOLD}  Pro v{version}{W}{DIM} — Scanner de vulnerabilidades web | Solo uso ético autorizado{W}
+ ██████╗ ██╗   ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗███╗   ██╗████████╗██╗   ██╗
+ ██╔══██╗██║   ██║██╔════╝ ██╔══██╗██╔═══██╗██║   ██║████╗  ██║╚══██╔══╝╚██╗ ██╔╝
+ ██████╔╝██║   ██║██║  ███╗██████╔╝██║   ██║██║   ██║██╔██╗ ██║   ██║    ╚████╔╝ 
+ ██╔══██╗██║   ██║██║   ██║██╔══██╗██║   ██║██║   ██║██║╚██╗██║   ██║     ╚██╔╝  
+ ██████╔╝╚██████╔╝╚██████╔╝██████╔╝╚██████╔╝╚██████╔╝██║ ╚████║   ██║      ██║   
+ ╚═════╝  ╚═════╝  ╚═════╝ ╚═════╝  ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝   ╚═╝      ╚═╝  
+{M}  ██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗     ██████╗ ██████╗  ██████╗ {W}
+{M}  ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗    ██╔══██╗██╔══██╗██╔═══██╗{W}
+{M}  ███████║██║   ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝    ██████╔╝██████╔╝██║   ██║{W}
+{M}  ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗    ██╔═══╝ ██╔══██╗██║   ██║{W}
+{M}  ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║    ██║     ██║  ██║╚██████╔╝{W}
+{M}  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝    ╚═╝     ╚═╝  ╚═╝ ╚═════╝ {W}
+{W}{BOLD}  v{version}{W}  {C}🤖 AI-Powered{W} · {G}Zero False Positives{W} · {M}Bug Bounty Ready{W}
+{DIM}  Solo para uso ético en sistemas propios o con autorización explícita.{W}
 """)

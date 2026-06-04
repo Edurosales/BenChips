@@ -2,7 +2,7 @@
 config.py — Toda la data: firmas, wordlists, payloads, constantes.
 """
 
-VERSION = "4.0"
+VERSION = "5.0"
 
 # ─── Default UA (fallback / no-stealth) ──────────────────────────────────────
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -363,14 +363,16 @@ SQLI_BLIND_MARGIN  = 3.5  # marge de confirmación: respuesta debe tardar al men
 # ─── SSTI Probes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 SSTI_PROBES = [
     # (payload, expected_result, engine_name)
+    # Orden: del más específico (menos FPs) al más genérico
+    ("{{7*'7'}}",    "7777777", "Jinja2 (distinguisher)"),   # solo Jinja2, no Twig
     ("{{7*7}}",      "49",      "Jinja2/Twig/Nunjucks"),
     ("${7*7}",       "49",      "Freemarker/Velocity/EL"),
     ("<%= 7*7 %>",   "49",      "ERB/EJS"),
     ("#{7*7}",       "49",      "Pebble/Slim"),
     ("*{7*7}",       "49",      "Thymeleaf"),
-    ("{7*7}",        "49",      "Custom Engine"),
     ("[[7*7]]",      "49",      "Velocity alt"),
-    ("{{7*'7'}}",    "7777777", "Jinja2 (distinguisher)"),
+    # "{7*7}" ELIMINADO: llaves solas aparecen en JSON/JS/CSS — demasiados FPs
+    # sin motivo de template engine específico que lo justifique.
 ]
 
 # ─── JS Library CVE Database ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
