@@ -83,6 +83,7 @@ class AsyncHTTPClient:
         max_retries:  int  = 2,
         stealth:      bool = False,
         auth_headers: Optional[dict] = None,
+        proxies:      Optional[list[str]] = None,
     ):
         self.session     = session
         self.semaphore   = asyncio.Semaphore(rate_limit)
@@ -91,12 +92,24 @@ class AsyncHTTPClient:
         self.stealth     = stealth
         self.baselines:  dict[str, Baseline] = {}
         self._auth_headers: dict = auth_headers or {}
+        # Proxies: lista de URLs http://user:pass@host:port o socks5://...
+        # Round-robin si hay varios. aiohttp solo soporta http(s) nativamente;
+        # para socks5 instalar aiohttp-socks.
+        self._proxies = proxies or []
+        self._proxy_index = 0
 
         # Headers base (no-stealth)
         self._base_headers = {
             "User-Agent": UA,
             "Accept":     "text/html,application/json,*/*;q=0.8",
         }
+
+    def _next_proxy(self) -> Optional[str]:
+        if not self._proxies:
+            return None
+        proxy = self._proxies[self._proxy_index % len(self._proxies)]
+        self._proxy_index += 1
+        return proxy
 
     def _build_headers(self, extra: Optional[dict] = None) -> dict:
         """Construye los headers para una petición, con o sin stealth."""
@@ -147,6 +160,7 @@ class AsyncHTTPClient:
                         allow_redirects = follow,
                         max_redirects   = max_redirects,
                         timeout         = self.timeout,
+                        proxy           = self._next_proxy(),
                     ) as r:
                         body = await r.read()
                         body = body[:body_limit]

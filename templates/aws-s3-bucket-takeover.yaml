@@ -1,0 +1,34 @@
+id: aws-s3-bucket-misconfigured
+info:
+  name: Bucket S3 con listing público
+  severity: HIGH
+  cvss: 7.5
+  description: |
+    Bucket S3 con permission ListBucket público. Permite enumerar todos los
+    archivos. Combinable con GetObject público → exfiltración masiva.
+  reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html
+  cwe: CWE-284
+  remediation: |
+    En AWS Console: bucket → Permissions → Block all public access.
+    Aplicar Policy explícita que deny lista para principal *.
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "<ListBucketResult"
+          - "<Contents>"
+          - "<Key>"
+        condition: and
+    extractors:
+      - type: regex
+        part: body
+        regex:
+          - "<Name>([^<]+)</Name>"
+          - "<Key>([^<]+)</Key>"

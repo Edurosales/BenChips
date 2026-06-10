@@ -1,0 +1,35 @@
+id: phpinfo-disclosure
+info:
+  name: phpinfo() expuesto
+  severity: HIGH
+  cvss: 7.5
+  description: |
+    phpinfo() expone toda la configuración del servidor PHP: variables de
+    entorno, paths del sistema, módulos cargados, info del cliente y server.
+    Permite enumerar fácilmente la superficie de ataque.
+  reference: https://www.php.net/manual/en/function.phpinfo.php
+  cwe: CWE-200
+  owasp: A05:2021
+  remediation: |
+    Eliminar todos los archivos phpinfo.php / info.php / test.php del público.
+    En php.ini: expose_php = Off
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/phpinfo.php"
+      - "{{BaseURL}}/info.php"
+      - "{{BaseURL}}/test.php"
+      - "{{BaseURL}}/i.php"
+      - "{{BaseURL}}/_phpinfo.php"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "PHP Version"
+          - "phpinfo()"
+          - "System "
+          - "Build Date"
+        condition: and

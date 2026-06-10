@@ -76,11 +76,12 @@ def prompt_auth() -> Optional[AuthConfig]:
     auth = AuthConfig()
 
     try:
-        cookies = input(f"  {C}▶{W}  Cookies (ej: session=abc; token=xyz): ").strip()
+        import getpass
+        cookies = getpass.getpass(f"  {C}▶{W}  Cookies (oculto; Enter omite): ").strip()
         if cookies:
             auth.cookies = cookies
 
-        token = input(f"  {C}▶{W}  Bearer Token (JWT / OAuth): ").strip()
+        token = getpass.getpass(f"  {C}▶{W}  Bearer Token (oculto; Enter omite): ").strip()
         if token:
             auth.bearer_token = token
 
@@ -88,7 +89,7 @@ def prompt_auth() -> Optional[AuthConfig]:
             user = input(f"  {C}▶{W}  Usuario Basic Auth: ").strip()
             if user:
                 auth.basic_user = user
-                auth.basic_pass = input(f"  {C}▶{W}  Contraseña: ").strip()
+                auth.basic_pass = getpass.getpass(f"  {C}▶{W}  Contraseña (oculto): ").strip()
 
         custom = input(f"  {C}▶{W}  Header custom (Nombre: Valor, Enter para omitir): ").strip()
         if custom and ":" in custom:

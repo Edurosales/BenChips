@@ -391,40 +391,95 @@ async def _test_traversal(
     parsed,
     probe_params: list[str],
 ) -> list[Vuln]:
+    """
+    Path Traversal con baseline y confirmación multi-indicador.
+
+    Anti-FP:
+      - Baseline con valor benigno: si el indicador (root:x:0:0) ya está en la página
+        sin payload, se ignora (la página legitimamente contiene esa cadena).
+      - Body hash debe diferir del baseline (servidor debe procesar el payload).
+      - Para /etc/passwd se requiere ADEMÁS un segundo indicador estructural
+        (línea daemon:x:1: o bin:x:1:1:) para descartar páginas tutoriales.
+    """
     vulns: list[Vuln] = []
     found: set[str]   = set()
     sem = asyncio.Semaphore(8)
 
+    # Indicadores secundarios para confirmación robusta
+    PASSWD_SECONDARY = re.compile(
+        r"(daemon:x:\d+:|bin:x:\d+:\d+:|nobody:x:|sys:x:\d+:)",
+        re.IGNORECASE,
+    )
+
+    # ── Baseline: body limpio por parámetro ──────────────────────────────────
+    baselines: dict[str, tuple[str, str]] = {}  # param -> (hash, body_lower)
+
+    async def _baseline(param: str):
+        clean_url = _inject_param(url, parsed, param, "1")
+        resp = await client.get(clean_url, follow=True, lax_ssl=True, body_limit=65536)
+        if resp:
+            baselines[param] = (
+                hashlib.md5(resp.body[:8192]).hexdigest(),
+                resp.text.lower(),
+            )
+
+    await asyncio.gather(*[_baseline(p) for p in probe_params[:3]])
+
     async def check(param: str, payload: str, indicator: str):
         async with sem:
+            if param in found:
+                return
             test_url = _inject_param(url, parsed, param, payload)
             resp = await client.get(test_url, follow=True, lax_ssl=True, body_limit=65536)
             if not resp:
                 return
-            if re.search(indicator, resp.text, re.IGNORECASE):
-                if param not in found:
-                    found.add(param)
-                    vulns.append(make_vuln(
-                        title       = f"Path Traversal en parámetro '{param}'",
-                        severity    = "CRITICAL",
-                        cvss        = 9.8,
-                        category    = "Path Traversal",
-                        description = (
-                            f"El parámetro '{param}' permite salir del directorio base "
-                            "y leer archivos del sistema operativo."
-                        ),
-                        evidence    = (
-                            f"Payload: {payload[:80]}\n"
-                            f"Indicador encontrado: {indicator}"
-                        ),
-                        fix         = (
-                            "Validar y canonicalizar rutas. "
-                            "Usar listas blancas de archivos permitidos. "
-                            "Ejecutar la aplicación con usuario de mínimos privilegios."
-                        ),
-                        ref         = "https://owasp.org/www-community/attacks/Path_Traversal",
-                        module      = "active",
-                    ))
+
+            body_lower = resp.text.lower()
+            body_hash  = hashlib.md5(resp.body[:8192]).hexdigest()
+            bl_hash, bl_body = baselines.get(param, ("", ""))
+
+            # Anti-FP 1: indicador ya presente en baseline (página de docs Linux, etc)
+            if bl_body and re.search(indicator, bl_body, re.IGNORECASE):
+                return
+
+            # Anti-FP 2: body idéntico al baseline → servidor ignoró el payload
+            if bl_hash and body_hash == bl_hash:
+                return
+
+            # Confirmación primaria
+            if not re.search(indicator, body_lower, re.IGNORECASE):
+                return
+
+            # Anti-FP 3: para /etc/passwd exigir secundario estructural
+            if "root:x:0:0" in indicator.lower() or "root:x:0:0" in body_lower:
+                if not PASSWD_SECONDARY.search(body_lower):
+                    return  # solo aparece la línea root → probablemente cita textual
+
+            found.add(param)
+            vulns.append(make_vuln(
+                title       = f"Path Traversal en parámetro '{param}'",
+                severity    = "CRITICAL",
+                cvss        = 9.8,
+                category    = "Path Traversal",
+                description = (
+                    f"El parámetro '{param}' permite salir del directorio base "
+                    "y leer archivos del sistema operativo."
+                ),
+                evidence    = (
+                    f"Payload: {payload[:80]}\n"
+                    f"Indicador primario: {indicator}\n"
+                    f"Baseline hash: {bl_hash[:8]} → Payload hash: {body_hash[:8]} (distintos)\n"
+                    f"PoC: curl '{test_url}'"
+                ),
+                fix         = (
+                    "Validar y canonicalizar rutas. "
+                    "Usar listas blancas de archivos permitidos. "
+                    "Ejecutar la aplicación con usuario de mínimos privilegios."
+                ),
+                ref         = "https://owasp.org/www-community/attacks/Path_Traversal",
+                module      = "active",
+                url         = url,
+            ))
 
     tasks = []
     for param in probe_params[:3]:

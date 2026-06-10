@@ -1,0 +1,35 @@
+id: laravel-debug-enabled
+info:
+  name: Laravel APP_DEBUG=true en producción
+  severity: HIGH
+  cvss: 7.5
+  description: |
+    Laravel devuelve páginas Whoops con stack traces, código fuente y datos
+    de entorno cuando APP_DEBUG=true. CVE-2021-3129 permite RCE en este modo
+    si laravel/framework < 8.4.3.
+  reference: https://www.ambionics.io/blog/laravel-debug-rce
+  cwe: CWE-489
+  owasp: A05:2021
+  remediation: |
+    Establecer APP_DEBUG=false en .env de producción.
+    Actualizar laravel/framework ≥ 8.4.3.
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.env"
+      - "{{BaseURL}}/_ignition/health-check"
+    matchers-condition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - "Whoops! There was an error"
+          - "/_ignition/"
+          - "Ignition\\Solutions"
+        condition: or
+      - type: word
+        part: body
+        words:
+          - "APP_DEBUG=true"
+          - "APP_ENV=local"
+        condition: or

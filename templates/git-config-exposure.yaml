@@ -1,0 +1,39 @@
+id: git-config-exposure
+info:
+  name: Repositorio Git expuesto (.git/config)
+  severity: CRITICAL
+  cvss: 9.8
+  description: |
+    El directorio .git/ es accesible públicamente. Permite reconstruir el
+    historial completo del código fuente, incluyendo credenciales eliminadas
+    en commits anteriores. Herramientas: git-dumper, gitdumper.sh.
+  reference: https://en.internetwache.org/dont-publicly-expose-git-or-how-we-downloaded-your-websites-sourcecode-an-analysis-of-alexas-1m-28-07-2015/
+  cwe: CWE-538
+  owasp: A05:2021
+  remediation: |
+    Bloquear acceso a /.git/ en el servidor web (location ~ /\.git { deny all; }).
+    En CI/CD: usar git archive en vez de clonar al directorio público.
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.git/config"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "[core]"
+        condition: or
+      - type: regex
+        part: body
+        regex:
+          - "\\[remote\\s+\""
+          - "repositoryformatversion"
+        condition: or
+    extractors:
+      - type: regex
+        part: body
+        regex:
+          - "url\\s*=\\s*\\S+"

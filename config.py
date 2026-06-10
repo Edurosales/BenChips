@@ -2,7 +2,7 @@
 config.py — Toda la data: firmas, wordlists, payloads, constantes.
 """
 
-VERSION = "5.0"
+VERSION = "6.0"
 
 # ─── Default UA (fallback / no-stealth) ──────────────────────────────────────
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -375,62 +375,100 @@ SSTI_PROBES = [
     # sin motivo de template engine específico que lo justifique.
 ]
 
-# ─── JS Library CVE Database ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-# lib_name_lower -> [(version_pattern, cve_list, severity, cvss, description)]
+# ─── JS Library CVE Database ──────────────────────────────────────────────────
+# Formato semver real: vulnerable si version < max_fixed
+# lib_name_lower -> [{max_fixed, cves, severity, cvss, description}, ...]
+# Ordenar de PEOR (rangos antiguos) a MENOS GRAVE para que el primer match gane
 JS_CVE_DB = {
     "jquery": [
-        (r"jquery[/-]1\.[0-9]\.",
-         ["CVE-2020-11022", "CVE-2020-11023", "CVE-2019-11358"],
-         "HIGH", 6.1,
-         "jQuery <1.x: XSS vía manipulación de HTML y prototype pollution"),
-        (r"jquery[/-]2\.[0-2]\.",
-         ["CVE-2020-11022", "CVE-2019-11358"],
-         "HIGH", 6.1,
-         "jQuery 2.x: XSS vía .html()/.append() con input no sanitizado"),
-        (r"jquery[/-]3\.[0-4]\.",
-         ["CVE-2020-11022", "CVE-2020-11023"],
-         "MEDIUM", 6.1,
-         "jQuery 3.0-3.4: XSS vía parseHTML con tags option"),
+        {"max_fixed": "1.9.0",
+         "cves": ["CVE-2012-6708", "CVE-2015-9251", "CVE-2019-11358", "CVE-2020-11022", "CVE-2020-11023"],
+         "severity": "HIGH", "cvss": 6.5,
+         "description": "jQuery <1.9: múltiples XSS y prototype pollution. Sin soporte."},
+        {"max_fixed": "3.0.0",
+         "cves": ["CVE-2019-11358", "CVE-2020-11022", "CVE-2020-11023", "CVE-2015-9251"],
+         "severity": "HIGH", "cvss": 6.1,
+         "description": "jQuery <3.0: XSS vía $.parseHTML, .html(), .append() con input no sanitizado"},
+        {"max_fixed": "3.5.0",
+         "cves": ["CVE-2020-11022", "CVE-2020-11023"],
+         "severity": "MEDIUM", "cvss": 6.1,
+         "description": "jQuery 3.0-3.4: XSS vía parseHTML con tags option (htmlPrefilter)"},
     ],
     "bootstrap": [
-        (r"bootstrap[/-][23]\.[0-3]\.",
-         ["CVE-2019-8331", "CVE-2018-14041", "CVE-2018-14042"],
-         "MEDIUM", 6.1,
-         "Bootstrap <3.4.1: XSS vía data-template en tooltip/popover"),
-        (r"bootstrap[/-]4\.[0-2]\.",
-         ["CVE-2019-8331"],
-         "MEDIUM", 6.1,
-         "Bootstrap 4.0-4.2: XSS vía data-template attribute"),
+        {"max_fixed": "3.4.1",
+         "cves": ["CVE-2019-8331", "CVE-2018-14041", "CVE-2018-14042", "CVE-2016-10735"],
+         "severity": "MEDIUM", "cvss": 6.1,
+         "description": "Bootstrap <3.4.1: XSS vía data-template en tooltip/popover, data-target en scrollspy"},
+        {"max_fixed": "4.3.1",
+         "cves": ["CVE-2019-8331"],
+         "severity": "MEDIUM", "cvss": 6.1,
+         "description": "Bootstrap <4.3.1: XSS vía data-template attribute en tooltip"},
     ],
     "angularjs": [
-        (r"angular[.-]1\.[0-7]\.",
-         ["CVE-2019-14863", "CVE-2020-7676"],
-         "HIGH", 6.1,
-         "AngularJS <1.8: XSS vía ng-attr-*, ng-class, interpolation bypass"),
+        {"max_fixed": "1.8.0",
+         "cves": ["CVE-2019-14863", "CVE-2020-7676", "CVE-2022-25844", "CVE-2023-26116"],
+         "severity": "HIGH", "cvss": 7.5,
+         "description": "AngularJS <1.8: XSS vía ng-attr-*, ng-class, interpolation bypass. Framework discontinuado."},
+        {"max_fixed": "1.9.0",
+         "cves": ["CVE-2022-25844", "CVE-2023-26116", "CVE-2023-26117", "CVE-2023-26118"],
+         "severity": "MEDIUM", "cvss": 5.3,
+         "description": "AngularJS <1.9 (Long-Term Support terminado en 2022): ReDoS y prototype pollution"},
     ],
     "lodash": [
-        (r"lodash[/-]([0-3]|4\.[0-9]|4\.1[0-6])\.",
-         ["CVE-2021-23337", "CVE-2020-8203", "CVE-2019-10744"],
-         "HIGH", 7.2,
-         "Lodash <4.17.21: Prototype pollution y command injection"),
+        {"max_fixed": "4.17.12",
+         "cves": ["CVE-2019-10744", "CVE-2018-16487", "CVE-2018-3721"],
+         "severity": "CRITICAL", "cvss": 9.1,
+         "description": "Lodash <4.17.12: Prototype pollution explotable a RCE en algunos contextos"},
+        {"max_fixed": "4.17.21",
+         "cves": ["CVE-2020-8203", "CVE-2021-23337"],
+         "severity": "HIGH", "cvss": 7.2,
+         "description": "Lodash <4.17.21: Command injection vía template y prototype pollution"},
     ],
     "moment": [
-        (r"moment[/-]([01]\.|2\.[0-8]\.|2\.9\.)",
-         ["CVE-2022-24785", "CVE-2022-31129"],
-         "HIGH", 7.5,
-         "Moment.js <2.29.4: ReDoS (regex DoS) y path traversal en locale"),
+        {"max_fixed": "2.19.3",
+         "cves": ["CVE-2017-18214"],
+         "severity": "HIGH", "cvss": 7.5,
+         "description": "Moment.js <2.19.3: ReDoS en parser de fechas"},
+        {"max_fixed": "2.29.2",
+         "cves": ["CVE-2022-24785"],
+         "severity": "HIGH", "cvss": 7.5,
+         "description": "Moment.js <2.29.2: Path traversal en require de locale"},
+        {"max_fixed": "2.29.4",
+         "cves": ["CVE-2022-31129"],
+         "severity": "HIGH", "cvss": 7.5,
+         "description": "Moment.js <2.29.4: ReDoS (regex DoS)"},
     ],
     "handlebars": [
-        (r"handlebars[/-][0-3]\.",
-         ["CVE-2021-23369", "CVE-2021-23383", "CVE-2019-19919"],
-         "CRITICAL", 9.8,
-         "Handlebars <4.7.7: Prototype pollution y RCE vía template injection"),
+        {"max_fixed": "4.7.7",
+         "cves": ["CVE-2021-23369", "CVE-2021-23383", "CVE-2019-19919", "CVE-2019-20920"],
+         "severity": "CRITICAL", "cvss": 9.8,
+         "description": "Handlebars <4.7.7: Prototype pollution y RCE vía template injection en strict mode"},
     ],
     "underscore": [
-        (r"underscore[/-]1\.[0-9]\.",
-         ["CVE-2021-23358"],
-         "HIGH", 7.2,
-         "Underscore.js <1.13.2: Arbitrary code execution vía template injection"),
+        {"max_fixed": "1.12.1",
+         "cves": ["CVE-2021-23358"],
+         "severity": "HIGH", "cvss": 7.2,
+         "description": "Underscore.js <1.12.1: Arbitrary code execution vía template injection"},
+    ],
+    "axios": [
+        {"max_fixed": "0.21.1",
+         "cves": ["CVE-2020-28168"],
+         "severity": "MEDIUM", "cvss": 5.9,
+         "description": "Axios <0.21.1: SSRF vía URL parsing inadecuado"},
+        {"max_fixed": "0.21.2",
+         "cves": ["CVE-2021-3749"],
+         "severity": "HIGH", "cvss": 7.5,
+         "description": "Axios <0.21.2: ReDoS en trim() de headers"},
+        {"max_fixed": "1.6.0",
+         "cves": ["CVE-2023-45857"],
+         "severity": "MEDIUM", "cvss": 6.5,
+         "description": "Axios <1.6.0: CSRF token leak por XSRF-TOKEN cookie a cross-site"},
+    ],
+    "vue": [
+        {"max_fixed": "2.7.14",
+         "cves": ["CVE-2024-6783"],
+         "severity": "MEDIUM", "cvss": 5.3,
+         "description": "Vue.js <2.7.14: XSS en template parser bajo condiciones específicas"},
     ],
 }
 

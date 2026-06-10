@@ -1,17 +1,47 @@
 id: env-file-exposure
 info:
-  name: Config / Environment File Exposure
-  severity: HIGH
-  description: Busca archivos .env expuestos que pueden contener credenciales.
+  name: Archivo .env expuesto
+  severity: CRITICAL
+  cvss: 9.8
+  description: |
+    Archivos .env contienen variables de entorno incluyendo credenciales de
+    base de datos, API keys de servicios externos y secretos de la aplicación.
+  reference: https://owasp.org/www-project-web-security-testing-guide/
+  cwe: CWE-200
+  owasp: A05:2021
+  remediation: |
+    Eliminar el archivo de la raíz web pública. Configurar el servidor para
+    denegar requests a archivos que empiecen con punto.
 requests:
   - method: GET
     path:
       - "{{BaseURL}}/.env"
+      - "{{BaseURL}}/.env.local"
+      - "{{BaseURL}}/.env.production"
+      - "{{BaseURL}}/.env.backup"
       - "{{BaseURL}}/config/.env"
+    matchers-condition: and
     matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - "^[A-Z_]+=.+"
+        condition: or
       - type: word
         part: body
         words:
-          - "DB_PASSWORD="
-          - "APP_KEY="
+          - "DB_PASSWORD"
+          - "APP_KEY"
           - "AWS_ACCESS_KEY"
+          - "DATABASE_URL"
+          - "SECRET_KEY"
+          - "JWT_SECRET"
+          - "STRIPE_KEY"
+        condition: or
+    extractors:
+      - type: regex
+        part: body
+        regex:
+          - "(DB_PASSWORD|APP_KEY|AWS_SECRET|JWT_SECRET)=[\\w-]+"

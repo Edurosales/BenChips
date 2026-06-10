@@ -1,0 +1,36 @@
+id: spring-actuator-exposure
+info:
+  name: Spring Boot Actuator expuesto sin autenticación
+  severity: CRITICAL
+  cvss: 9.8
+  description: |
+    Spring Boot Actuator expone endpoints administrativos que permiten leer
+    variables de entorno, hacer heap dumps con credenciales, ejecutar tareas
+    Quartz o cambiar la configuración en runtime.
+  reference: https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html
+  cwe: CWE-200
+  owasp: A05:2021
+  remediation: |
+    management.endpoints.web.exposure.include=health,info
+    management.endpoint.health.show-details=never
+    Proteger el contexto /actuator con Spring Security.
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/actuator"
+      - "{{BaseURL}}/actuator/env"
+      - "{{BaseURL}}/actuator/heapdump"
+      - "{{BaseURL}}/actuator/mappings"
+      - "{{BaseURL}}/management"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "\"_links\""
+          - "\"profiles\""
+          - "\"propertySources\""
+          - "\"systemEnvironment\""
+        condition: or

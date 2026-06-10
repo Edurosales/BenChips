@@ -939,3 +939,381 @@ def generate_pdf(
 
     doc.build(story)
     return True
+
+
+# ─── Markdown (HackerOne / Bugcrowd / genérico) ──────────────────────────────
+
+def _md_severity_badge(sev: str) -> str:
+    icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢", "INFO": "⚪"}
+    return f"{icons.get(sev, '⚪')} **{sev}**"
+
+
+def generate_markdown_h1(
+    url: str,
+    vulns: list[Vuln],
+    meta: dict,
+    duration: float,
+    ai_analyses: Optional[dict] = None,
+    exec_summary: str = "",
+) -> str:
+    """
+    Formato HackerOne: un report por vulnerabilidad. Por defecto, retorna
+    SOLO el primer CRITICAL/HIGH. Si quieres un report combinado, llamar
+    generate_markdown_h1_combined.
+    """
+    if not vulns:
+        return "# Sin hallazgos para reportar"
+
+    top = next((v for v in vulns if v.severity in ("CRITICAL", "HIGH")), vulns[0])
+    ai = (ai_analyses or {}).get(top.dedup_key, {})
+
+    poc = ai.get("poc_curl") or "*(generar con `curl -i '" + url + "'`)*"
+    report_title = ai.get("report_title") or top.title
+    impact_demo = ai.get("impact_demo", "")
+    cvss_vec = top.cvss_vector or ai.get("cvss_vector", "")
+    cvss_extra = f" — `{cvss_vec}`" if cvss_vec else ""
+
+    cwe_line = f"**CWE:** {top.cwe}" if top.cwe else ""
+    owasp_line = f"**OWASP:** {top.owasp}" if top.owasp else ""
+
+    impact_demo_block = ""
+    if impact_demo:
+        impact_demo_block = f"### Impact Demonstration\n\n{impact_demo}\n"
+
+    cwe_ref_line = ""
+    if top.cwe:
+        cwe_num = top.cwe.replace("CWE-", "")
+        cwe_ref_line = f"- CWE-{cwe_num}: https://cwe.mitre.org/data/definitions/{cwe_num}.html"
+
+    return f"""## {report_title}
+
+**Severity:** {_md_severity_badge(top.severity)} (CVSS {top.cvss}{cvss_extra})
+**Category:** {top.category}
+**Target:** `{url}`
+{cwe_line}
+{owasp_line}
+
+### Summary
+
+{top.description}
+
+### Steps to Reproduce
+
+1. Authenticate as a normal user (or anonymous if N/A).
+2. Send the following request:
+
+```bash
+{poc}
+```
+
+3. Observe the response.
+
+### Proof of Concept
+
+```
+{top.evidence}
+```
+
+{impact_demo_block}
+
+### Impact
+
+{ai.get("business_impact", top.description)}
+
+### Suggested Fix
+
+{ai.get("detailed_fix", top.fix)}
+
+### References
+
+- {top.ref}
+{cwe_ref_line}
+
+---
+*Reported via BugBountyHunter Pro v{VERSION} — Scan duration: {duration:.1f}s*
+"""
+
+
+def generate_markdown_bugcrowd(
+    url: str,
+    vulns: list[Vuln],
+    meta: dict,
+    duration: float,
+    ai_analyses: Optional[dict] = None,
+    exec_summary: str = "",
+) -> str:
+    """Reporte combinado estilo Bugcrowd VRT — todos los hallazgos."""
+    counts       = count_by_severity(vulns)
+    score, level = risk_score(counts)
+
+    out = [
+        f"# Security Assessment — {url}",
+        "",
+        f"**Date:** {datetime.now().strftime('%Y-%m-%d')}  ",
+        f"**Tool:** BugBountyHunter Pro v{VERSION}  ",
+        f"**Duration:** {duration:.1f}s  ",
+        f"**Risk:** {level} (score {score})  ",
+        f"**Findings:** "
+        f"{counts['CRITICAL']}C / {counts['HIGH']}H / {counts['MEDIUM']}M / "
+        f"{counts['LOW']}L / {counts['INFO']}I",
+        "",
+    ]
+
+    if exec_summary:
+        out += ["## Executive Summary", "", exec_summary, ""]
+
+    techs = meta.get("technologies") or []
+    ips   = meta.get("ips") or []
+    out += [
+        "## Target Info",
+        "",
+        f"- **IPs:** {', '.join(ips) or 'N/A'}",
+        f"- **Server:** {meta.get('server', 'unknown')}",
+        f"- **WAF:** {meta.get('waf') or 'none detected'}",
+        f"- **Technologies:** {', '.join(techs) or 'unknown'}",
+        "",
+    ]
+
+    out.append("## Findings")
+    out.append("")
+
+    for i, v in enumerate(vulns, 1):
+        if v.severity == "INFO":
+            continue
+        ai = (ai_analyses or {}).get(v.dedup_key, {})
+        cvss_vec = v.cvss_vector or ai.get("cvss_vector", "")
+        out += [
+            f"### {i}. {v.title}",
+            "",
+            f"- **Severity:** {_md_severity_badge(v.severity)}",
+            f"- **CVSS:** {v.cvss}" + (f" `{cvss_vec}`" if cvss_vec else ""),
+            f"- **Category:** {v.category}",
+        ]
+        if v.cwe:
+            out.append(f"- **CWE:** {v.cwe}")
+        if v.owasp:
+            out.append(f"- **OWASP:** {v.owasp}")
+        if v.url and v.url != url:
+            out.append(f"- **URL:** `{v.url}`")
+        out += [
+            "",
+            f"**Description:** {v.description}",
+            "",
+            "**Evidence:**",
+            "",
+            "```",
+            v.evidence,
+            "```",
+            "",
+            f"**Fix:** {v.fix}",
+            "",
+        ]
+        if v.ref:
+            out += [f"**Reference:** {v.ref}", ""]
+        out.append("---")
+        out.append("")
+
+    return "\n".join(out)
+
+
+# ─── Markdown Intigriti / YesWeHack ──────────────────────────────────────────
+
+def generate_markdown_intigriti(
+    url: str,
+    vulns: list[Vuln],
+    meta: dict,
+    duration: float,
+    ai_analyses: Optional[dict] = None,
+    exec_summary: str = "",
+) -> str:
+    """
+    Formato Intigriti: usa estructura específica del platform
+    (Issue, Steps to reproduce, Severity, CVSS, Affected URL, Suggested fix).
+    """
+    if not vulns:
+        return "# No findings to report"
+
+    top = next((v for v in vulns if v.severity in ("CRITICAL", "HIGH")), vulns[0])
+    ai = (ai_analyses or {}).get(top.dedup_key, {})
+
+    cvss_vec = top.cvss_vector or ai.get("cvss_vector", "")
+    cvss_str = f"{top.cvss}" + (f" — {cvss_vec}" if cvss_vec else "")
+    poc = ai.get("poc_curl") or f"curl -i '{url}'"
+
+    return f"""# {ai.get("report_title") or top.title}
+
+## Issue
+
+{top.description}
+
+## Severity & Impact
+
+- **Severity:** {top.severity}
+- **CVSS Score:** {cvss_str}
+- **Category:** {top.category}
+- **CWE:** {top.cwe or 'N/A'}
+- **Impact:** {ai.get("business_impact", top.description)}
+
+## Affected URL
+
+`{top.url or url}`
+
+## Steps to Reproduce
+
+```bash
+{poc}
+```
+
+## Proof of Concept
+
+```
+{top.evidence}
+```
+
+## Suggested Fix
+
+{ai.get("detailed_fix", top.fix)}
+
+## References
+
+- {top.ref}
+"""
+
+
+def generate_markdown_yeswehack(
+    url: str,
+    vulns: list[Vuln],
+    meta: dict,
+    duration: float,
+    ai_analyses: Optional[dict] = None,
+    exec_summary: str = "",
+) -> str:
+    """YesWeHack format: muy similar a Intigriti pero con CVSS:3.1 vector explícito."""
+    if not vulns:
+        return "# No findings"
+
+    top = next((v for v in vulns if v.severity in ("CRITICAL", "HIGH")), vulns[0])
+    ai = (ai_analyses or {}).get(top.dedup_key, {})
+    cvss_vec = top.cvss_vector or ai.get("cvss_vector", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
+    poc = ai.get("poc_curl") or f"curl -i '{url}'"
+
+    return f"""# {top.title}
+
+| Field           | Value |
+|----------------|-------|
+| **Severity**   | {top.severity} (CVSS {top.cvss}) |
+| **CVSS Vector**| `{cvss_vec}` |
+| **Category**   | {top.category} |
+| **CWE**        | {top.cwe or 'N/A'} |
+| **Endpoint**   | `{top.url or url}` |
+
+## Description
+
+{top.description}
+
+## Reproduction Steps
+
+1. Identify the vulnerable endpoint: `{top.url or url}`
+2. Send the following request:
+
+```bash
+{poc}
+```
+
+3. Verify the response indicators below.
+
+## Evidence
+
+```
+{top.evidence}
+```
+
+## Impact
+
+{ai.get("business_impact", "Refer to description.")}
+
+## Remediation
+
+{ai.get("detailed_fix", top.fix)}
+
+## References
+
+- {top.ref}
+"""
+
+
+# ─── SARIF (GitHub Code Scanning compatible) ──────────────────────────────────
+
+def generate_sarif(
+    url: str,
+    vulns: list[Vuln],
+    meta: dict,
+    duration: float,
+) -> str:
+    """
+    SARIF 2.1.0 export — compatible con GitHub Code Scanning, Azure DevOps,
+    GitLab Security Dashboard.
+    """
+    sev_to_level = {
+        "CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning",
+        "LOW": "note", "INFO": "note",
+    }
+    rules = []
+    results = []
+    rule_idx: dict[str, int] = {}
+
+    for v in vulns:
+        rule_id = v.category.replace(" ", "_") + ":" + v.title[:40].replace(" ", "_")
+        if rule_id not in rule_idx:
+            rule_idx[rule_id] = len(rules)
+            rules.append({
+                "id": rule_id,
+                "name": v.title,
+                "shortDescription": {"text": v.title[:120]},
+                "fullDescription":  {"text": v.description},
+                "helpUri":          v.ref or "",
+                "properties": {
+                    "category": v.category,
+                    "cwe":      v.cwe,
+                    "owasp":    v.owasp,
+                    "security-severity": str(v.cvss),
+                },
+            })
+        results.append({
+            "ruleId":  rule_id,
+            "ruleIndex": rule_idx[rule_id],
+            "level":   sev_to_level.get(v.severity, "warning"),
+            "message": {"text": v.evidence[:500]},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": v.url or url},
+                }
+            }],
+            "properties": {
+                "cvss":        v.cvss,
+                "cvss_vector": v.cvss_vector,
+                "confidence":  v.confidence,
+            },
+        })
+
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name":         "BugBountyHunter Pro",
+                    "version":      VERSION,
+                    "informationUri": "https://github.com/",
+                    "rules":        rules,
+                }
+            },
+            "results":   results,
+            "invocations": [{
+                "executionSuccessful": True,
+                "endTimeUtc": datetime.utcnow().isoformat() + "Z",
+            }],
+        }],
+    }
+    return json.dumps(sarif, indent=2, ensure_ascii=False)
+

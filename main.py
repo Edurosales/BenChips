@@ -80,7 +80,8 @@ def _prompt_ai_setup() -> dict | None:
         return None
 
     try:
-        api_key = input(f"  {C}▶{W}  API Key: ").strip()
+        import getpass
+        api_key = getpass.getpass(f"  {C}▶{W}  API Key (no se mostrará): ").strip()
         model   = input(f"  {C}▶{W}  Modelo (Enter = gpt-4o-mini): ").strip() or "gpt-4o-mini"
     except (KeyboardInterrupt, EOFError):
         return None
@@ -139,9 +140,18 @@ def _prompt_options() -> dict:
     html    = ask("Generar reporte   HTML")
     json_r  = ask("Generar reporte   JSON")
     pdf     = ask("Generar reporte   PDF ejecutivo")
+    md_h1   = ask("Generar reporte   Markdown HackerOne")
+    md_bc   = ask("Generar reporte   Markdown Bugcrowd")
+    sarif   = ask("Generar reporte   SARIF (GitHub Code Scanning)")
 
     print()
     out = input(f"  {C}?{W}  Nombre base del reporte (Enter = auto): ").strip()
+
+    print()
+    proxy_str = input(
+        f"  {C}?{W}  Proxies (lista CSV, p.ej. http://127.0.0.1:8080,http://10.0.0.1:3128; Enter omite): "
+    ).strip()
+    proxies = [p.strip() for p in proxy_str.split(",") if p.strip()] if proxy_str else []
 
     return {
         "full":      full,
@@ -152,7 +162,11 @@ def _prompt_options() -> dict:
         "html":      html,
         "json":      json_r,
         "pdf":       pdf,
+        "md_h1":     md_h1,
+        "md_bc":     md_bc,
+        "sarif":     sarif,
         "output":    out,
+        "proxies":   proxies,
     }
 
 
@@ -227,6 +241,7 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
         print_sep()
 
     # ── Escaneo principal ─────────────────────────────────────────────────────
+    proxies = opts.get("proxies") or []
     try:
         vulns, meta, duration = await scan(
             url         = url,
@@ -236,6 +251,7 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
             stealth     = opts.get("stealth", False),
             auth_config = auth_config,
             use_oob     = opts.get("active", False),  # OOB solo en modo activo
+            proxies     = proxies,
         )
     except Exception as e:
         print_err(f"Error durante el escaneo: {e}")
@@ -274,6 +290,31 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
         for k, dd in deep_dive.items():
             if k in ai_analyses:
                 ai_analyses[k].update(dd)
+
+        # Propagar CVSS vector real del deep_dive a cada vuln
+        from utils.vuln import validate_cvss_vector
+        for v in vulns:
+            dd = deep_dive.get(v.dedup_key) or {}
+            vec = dd.get("cvss_vector", "")
+            if vec and validate_cvss_vector(vec):
+                v.cvss_vector = vec
+                # __post_init__ no se ejecuta al asignar, recalcular manualmente
+                from utils.vuln import cvss3_score_from_vector, cvss_severity
+                score = cvss3_score_from_vector(vec)
+                if score is not None:
+                    v.cvss = score
+                    v.severity = cvss_severity(score)
+            # Enriquecer CWE/OWASP desde el triaje IA
+            triage_entry = ai_analyses.get(v.dedup_key) or {}
+            if not v.cwe:
+                cwes = triage_entry.get("cwe_ids") or []
+                if cwes:
+                    v.cwe = cwes[0] if isinstance(cwes, list) else str(cwes)
+            if not v.owasp:
+                v.owasp = triage_entry.get("owasp_category", "") or ""
+            conf = triage_entry.get("confidence")
+            if isinstance(conf, (int, float)):
+                v.confidence = int(conf)
 
 
     # ── Resultados ────────────────────────────────────────────────────────────
@@ -425,6 +466,42 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
                 generated.append(f"PDF  → {os.path.abspath(pdf_path)}")
         except Exception as e:
             print_err(f"Error generando PDF: {e}")
+
+    if opts.get("md_h1"):
+        md_path = base_path + ".h1.md"
+        try:
+            from report import generate_markdown_h1
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(generate_markdown_h1(
+                    url, vulns, meta, duration,
+                    ai_analyses=ai_analyses, exec_summary=exec_summary,
+                ))
+            generated.append(f"MD H1 → {os.path.abspath(md_path)}")
+        except Exception as e:
+            print_err(f"Error generando Markdown H1: {e}")
+
+    if opts.get("md_bc"):
+        md_path = base_path + ".bugcrowd.md"
+        try:
+            from report import generate_markdown_bugcrowd
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(generate_markdown_bugcrowd(
+                    url, vulns, meta, duration,
+                    ai_analyses=ai_analyses, exec_summary=exec_summary,
+                ))
+            generated.append(f"MD BC → {os.path.abspath(md_path)}")
+        except Exception as e:
+            print_err(f"Error generando Markdown Bugcrowd: {e}")
+
+    if opts.get("sarif"):
+        sarif_path = base_path + ".sarif"
+        try:
+            from report import generate_sarif
+            with open(sarif_path, "w", encoding="utf-8") as f:
+                f.write(generate_sarif(url, vulns, meta, duration))
+            generated.append(f"SARIF → {os.path.abspath(sarif_path)}")
+        except Exception as e:
+            print_err(f"Error generando SARIF: {e}")
 
     if generated:
         print(f"\n  {G}📄 Reportes generados:{W}")

@@ -18,7 +18,12 @@ from utils.colors import (
     print_vuln, progress_bar, print_sep, sev_color, W, BOLD, C, G, O, DIM, spinner_async
 )
 
-from modules import recon, headers, ssl_tls, http_methods, paths, ports, redirects, waf, content, active, api_discovery, js_cve, ssti, admin_panels, forms, jwt_scan, graphql, xxe, yaml_engine
+from modules import (
+    recon, headers, ssl_tls, http_methods, paths, ports, redirects, waf, content,
+    active, api_discovery, js_cve, ssti, admin_panels, forms, jwt_scan, graphql,
+    xxe, yaml_engine,
+    host_header, cache_poisoning, crlf, nosql, prototype_pollution, smuggling,
+)
 
 
 async def scan(
@@ -30,6 +35,7 @@ async def scan(
     stealth:     bool = False,
     auth_config  = None,      # utils.auth.AuthConfig | None
     use_oob:     bool = True, # intentar OOB con interactsh
+    proxies:     list[str] | None = None,
 ) -> tuple[list[Vuln], dict, float]:
     """
     Ejecuta el escaneo completo de forma async.
@@ -73,6 +79,7 @@ async def scan(
         client = AsyncHTTPClient(
             session, rate_limit=20, timeout=10,
             stealth=stealth, auth_headers=auth_headers,
+            proxies=proxies,
         )
 
         # ── OOB client (interactsh) ───────────────────────────────────────────
@@ -285,6 +292,22 @@ async def scan(
             print_warn(f"[{len(apis)}] Endpoints API encontrados")
         print_ok(f"[{others}] Otros links o peticiones JS detectados")
 
+        # ── Pasivos avanzados (siempre, son rápidos y de bajo riesgo) ──────────
+        print_section("Misc", "Host Header / Cache Poisoning / SRI / Mixed Content")
+        async with spinner_async("Host header injection"):
+            hh_vulns = await host_header.run(client, url)
+        all_vulns.extend(hh_vulns)
+
+        async with spinner_async("Cache poisoning"):
+            cp_vulns = await cache_poisoning.run(client, url)
+        all_vulns.extend(cp_vulns)
+
+        total_passive_adv = len(hh_vulns) + len(cp_vulns)
+        if total_passive_adv > 0:
+            print_warn(f"Pasivos avanzados: {total_passive_adv} hallazgos")
+        else:
+            print_ok("Sin host header injection ni cache poisoning")
+
         # ── 10. Active Scan ────────────────────────────────────────────────────
         if active_scan:
             print_section("10/10", "Escaneo Activo (SQLi / SSTI / XSS / Traversal / SSRF)")
@@ -327,6 +350,35 @@ async def scan(
             if xxe_vulns:
                 print_warn(f"XXE: {len(xxe_vulns)} hallazgos")
 
+            # CRLF Injection
+            async with spinner_async("Probando CRLF injection"):
+                crlf_vulns = await crlf.run(client, url)
+            all_vulns.extend(crlf_vulns)
+            if crlf_vulns:
+                print_warn(f"CRLF: {len(crlf_vulns)} hallazgos")
+
+            # NoSQL Injection
+            async with spinner_async("Probando NoSQL injection"):
+                nosql_vulns = await nosql.run(client, url)
+            all_vulns.extend(nosql_vulns)
+            if nosql_vulns:
+                print_warn(f"NoSQL: {len(nosql_vulns)} hallazgos")
+
+            # Prototype Pollution
+            async with spinner_async("Probando prototype pollution"):
+                pp_vulns = await prototype_pollution.run(client, url)
+            all_vulns.extend(pp_vulns)
+            if pp_vulns:
+                print_warn(f"Prototype Pollution: {len(pp_vulns)} hallazgos")
+
+            # HTTP Request Smuggling (solo en full_scan, es invasivo)
+            if full_scan:
+                async with spinner_async("Probando HTTP request smuggling"):
+                    sm_vulns = await smuggling.run(client, url, enabled=True)
+                all_vulns.extend(sm_vulns)
+                if sm_vulns:
+                    print_warn(f"Smuggling: {len(sm_vulns)} hallazgos")
+
             # YAML Engine (Nuclei-style)
             async with spinner_async("Ejecutando firmas Nuclei"):
                 yaml_vulns = await yaml_engine.run(client, url)
@@ -334,7 +386,11 @@ async def scan(
             if yaml_vulns:
                 print_warn(f"YAML Templates: {len(yaml_vulns)} hallazgos")
 
-            total_active = len(ssti_vulns) + len(active_vulns) + len(form_vulns) + len(gql_vulns) + len(xxe_vulns) + len(yaml_vulns)
+            extra_active = len(crlf_vulns) + len(nosql_vulns) + len(pp_vulns)
+            total_active = (
+                len(ssti_vulns) + len(active_vulns) + len(form_vulns)
+                + len(gql_vulns) + len(xxe_vulns) + len(yaml_vulns) + extra_active
+            )
             if total_active > 0:
                 print_warn(f"Activo: {total_active} hallazgos en total")
             else:

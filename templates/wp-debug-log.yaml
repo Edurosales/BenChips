@@ -1,0 +1,27 @@
+id: wordpress-debug-log
+info:
+  name: WordPress debug.log expuesto
+  severity: HIGH
+  cvss: 7.5
+  description: |
+    El archivo wp-content/debug.log contiene errores PHP, paths del servidor
+    y a veces credenciales loggeadas. Lo deja activo WP_DEBUG_LOG=true.
+  cwe: CWE-532
+  remediation: |
+    Mover el log fuera del directorio web público.
+    En wp-config.php: define('WP_DEBUG_LOG', '/var/log/wp-debug.log');
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/wp-content/debug.log"
+      - "{{BaseURL}}/wp-content/uploads/debug.log"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - "\\[\\d{2}-\\w{3}-\\d{4}"
+          - "PHP (Warning|Notice|Fatal|Error)"
+        condition: or

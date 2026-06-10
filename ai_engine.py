@@ -37,8 +37,17 @@ def load_ai_config() -> dict:
 
 
 def save_ai_config(config: dict) -> None:
+    """
+    Guarda la config con permisos restrictivos.
+    POSIX: 0600 (solo el dueño lee/escribe).
+    Windows: ACL no aplicable directamente; chmod 0600 funciona para herencia básica.
+    """
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+    try:
+        os.chmod(_CONFIG_FILE, 0o600)
+    except OSError:
+        pass  # Windows no siempre lo respeta; lo intentamos best-effort
 
 
 class AIEngine:
@@ -108,6 +117,7 @@ class AIEngine:
         }
 
         # Intentar hasta 15 veces para sortear el rate limit agresivo de forma transparente
+        last_error_class = "unknown"
         for attempt in range(15):
             async with self._semaphore:
                 try:
@@ -117,19 +127,29 @@ class AIEngine:
                             endpoint, json=payload, headers=headers,
                             timeout=aiohttp.ClientTimeout(total=120)
                         ) as resp:
-                            if resp.status == 429:
-                                # Extraer tiempo de espera del header si existe
+                            status = resp.status
+
+                            if status == 401 or status == 403:
+                                last_error_class = "auth"
+                                self._available = False
+                                return None  # API key inválida: no reintentar
+
+                            if status == 429:
                                 wait_time = resp.headers.get("Retry-After", resp.headers.get("x-ratelimit-reset"))
                                 try:
                                     wait_time = float(wait_time) if wait_time else (2 ** attempt * 2)
                                 except ValueError:
                                     wait_time = 2 ** attempt * 2
-                                
-                                # Si dice que esperemos demasiado, capamos a 60s max por intento para no colgar infinito
                                 wait_time = min(max(wait_time + 1.0, 5.0), 60.0)
+                                last_error_class = "rate_limit"
                                 await asyncio.sleep(wait_time)
                                 continue
-                            
+
+                            if status >= 500:
+                                last_error_class = f"server_{status}"
+                                await asyncio.sleep(min(2 ** attempt, 30))
+                                continue
+
                             data = await resp.json(content_type=None)
 
                     usage = data.get("usage", {})
@@ -137,18 +157,25 @@ class AIEngine:
                     self._calls_made        += 1
 
                     if "error" in data:
-                        err = data["error"].get("message", "").lower()
-                        if "rate limit" in err:
-                            # A veces el error de Groq dice "Please try again in 5.6s"
+                        err_obj = data["error"]
+                        err = (err_obj.get("message", "") if isinstance(err_obj, dict) else str(err_obj)).lower()
+                        if "rate limit" in err or "too many requests" in err:
                             wait_time = 15.0
                             import re
                             match = re.search(r"try again in ([\d\.]+)s", err)
                             if match:
                                 wait_time = float(match.group(1)) + 1.0
+                            last_error_class = "rate_limit"
                             await asyncio.sleep(wait_time)
                             continue
-                        if any(x in err for x in ("quota", "insufficient", "billing")):
+                        if any(x in err for x in ("quota", "insufficient", "billing", "credit")):
+                            last_error_class = "billing"
                             self._available = False
+                        elif any(x in err for x in ("invalid api key", "incorrect api key", "unauthorized")):
+                            last_error_class = "auth"
+                            self._available = False
+                        else:
+                            last_error_class = "api_error"
                         return None
 
                     choices = data.get("choices", [])
@@ -156,15 +183,21 @@ class AIEngine:
                         return choices[0]["message"]["content"].strip()
 
                 except asyncio.TimeoutError:
+                    last_error_class = "timeout"
                     await asyncio.sleep(2 ** attempt)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
+                except aiohttp.ClientConnectorError:
+                    last_error_class = "dns_or_connect"
+                    await asyncio.sleep(2 ** attempt)
+                except aiohttp.ClientSSLError:
+                    last_error_class = "tls"
+                    await asyncio.sleep(2)
+                except Exception:
+                    last_error_class = "transport"
                     await asyncio.sleep(2)
 
-        raise Exception("API Limit reached / Connection failed después de 15 intentos.")
+        raise Exception(f"AI call failed after 15 attempts ({last_error_class})")
 
-    def _parse_json(self, resp: str) -> Optional[dict | list]:
+    def _parse_json(self, resp: Optional[str]) -> Optional[dict | list]:
         """Extrae JSON de la respuesta (tolerante a markdown)."""
         if not resp:
             return None
@@ -565,7 +598,7 @@ Generate exact PoC and exploitation steps for each. Respond ONLY with JSON array
         vulns: list["Vuln"],
         target_url: str,
         max_vulns: int = 20,
-        meta: dict = None,
+        meta: Optional[dict] = None,
     ) -> dict[str, dict]:
         """Compatibilidad con llamadas antiguas — usa mass_triage internamente."""
         return await self.mass_triage(vulns[:max_vulns], target_url, meta or {})

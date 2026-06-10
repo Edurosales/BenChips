@@ -1,0 +1,40 @@
+id: swagger-api-exposure
+info:
+  name: Documentación Swagger/OpenAPI expuesta
+  severity: MEDIUM
+  cvss: 5.3
+  description: |
+    Documentación de API completa accesible públicamente. Aunque no es una
+    vulnerabilidad directa, expone toda la superficie de ataque y a menudo
+    incluye endpoints internos o no documentados públicamente.
+  reference: https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+  cwe: CWE-200
+  owasp: A05:2021
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/swagger-ui/"
+      - "{{BaseURL}}/swagger-ui.html"
+      - "{{BaseURL}}/v2/api-docs"
+      - "{{BaseURL}}/v3/api-docs"
+      - "{{BaseURL}}/openapi.json"
+      - "{{BaseURL}}/api/swagger"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "\"swagger\""
+          - "\"openapi\""
+          - "swagger-ui"
+          - "Swagger UI"
+          - "redoc"
+        condition: or
+    extractors:
+      - type: regex
+        part: body
+        regex:
+          - "\"version\"\\s*:\\s*\"[^\"]+\""
+          - "\"title\"\\s*:\\s*\"[^\"]+\""
