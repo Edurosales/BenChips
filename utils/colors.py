@@ -1,9 +1,27 @@
 """
 utils/colors.py — Colores ANSI y helpers de output en consola.
+
+Log sink: la Web UI y el API server pueden capturar la salida en tiempo real
+llamando set_log_sink(sink) donde sink tiene .append(str). Puede ser una
+lista Python o un _ScanLog (que notifica waiters SSE en tiempo real).
 """
 
 import sys
 import shutil
+
+# ─── Log sink para Web UI / API ──────────────────────────────────────────────
+_log_sink = None  # cualquier objeto con .append(str)
+
+
+def set_log_sink(sink) -> None:
+    """Instala un sink de log. Debe tener .append(str). None para desactivar."""
+    global _log_sink
+    _log_sink = sink
+
+
+def _emit(text: str) -> None:
+    if _log_sink is not None:
+        _log_sink.append(text)
 
 # ─── Paleta ───────────────────────────────────────────────────────────────────
 R    = "\033[91m"
@@ -61,24 +79,30 @@ def print_sep(char="═", color=None):
 def print_section(num: str, title: str):
     width = min(term_width(), 78)
     pad   = width - len(f"  {num} — {title}  ") - 2
-    print(f"\n{BOLD}{BG}  {C}{num} — {title}{W}{BG}{' ' * max(0, pad)}  {W}")
+    line  = f"\n{BOLD}{BG}  {C}{num} — {title}{W}{BG}{' ' * max(0, pad)}  {W}"
+    print(line)
+    _emit(f"\n▶ {num} — {title}")
 
 
 def print_ok(msg: str, detail: str = ""):
     tail = f" {DIM}{detail}{W}" if detail else ""
     print(f"  {G}✓{W} {msg}{tail}")
+    _emit(f"  ✓ {msg}" + (f" {detail}" if detail else ""))
 
 
 def print_warn(msg: str):
     print(f"  {O}⚠{W}  {msg}")
+    _emit(f"  ⚠ {msg}")
 
 
 def print_err(msg: str):
     print(f"  {R}✗{W}  {msg}")
+    _emit(f"  ✗ {msg}")
 
 
 def print_info(msg: str):
     print(f"  {C}→{W}  {DIM}{msg}{W}")
+    _emit(f"  → {msg}")
 
 
 def print_vuln(idx: int, v):

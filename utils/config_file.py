@@ -65,4 +65,16 @@ def merge_opts_with_rc(opts: dict, rc: dict) -> dict:
         out["scope_file"] = rc["scope_file"]
     if rc.get("excluded_modules"):
         out["excluded_modules"] = rc["excluded_modules"]
+    # Per-module concurrency (e.g. paths: 30, ports: 50)
+    if rc.get("module_concurrency"):
+        out["module_concurrency"] = rc["module_concurrency"]
+    # Per-module rate limit
+    if rc.get("module_rate_limit"):
+        out["module_rate_limit"] = rc["module_rate_limit"]
     return out
+
+
+def get_module_concurrency(opts: dict, module_name: str, default: int) -> int:
+    """Devuelve la concurrencia configurada para `module_name` o `default`."""
+    mc = opts.get("module_concurrency") or {}
+    return int(mc.get(module_name, default))

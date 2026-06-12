@@ -22,6 +22,12 @@ except ImportError:
 from config import UA
 
 
+class _NullCtx:
+    """Async context manager no-op para cuando no hay rate limit per-host."""
+    async def __aenter__(self):  return None
+    async def __aexit__(self, *a): return False
+
+
 class Baseline:
     """Fingerprint de respuesta para detectar soft-404."""
 
@@ -150,8 +156,19 @@ class AsyncHTTPClient:
         hdrs          = self._build_headers(extra_headers)
         max_redirects = 10 if follow else 0
 
+        # ── v7.1: out-of-scope filter (no-op si no se configuró) ─────────────
+        scope = getattr(self, "scope_filter", None)
+        if scope is not None and not scope.is_in_scope(url):
+            return None
+
+        # ── v7.1: adaptive rate per host (semaphore acquired below) ──────────
+        adaptive = getattr(self, "adaptive_rate", None)
+
         for attempt in range(self.max_retries + 1):
+            # Adaptive per-host semaphore o global semaphore
+            per_host_sem = adaptive.get_semaphore(url) if adaptive else None
             async with self.semaphore:
+              async with (per_host_sem if per_host_sem else _NullCtx()):
                 try:
                     async with self.session.request(
                         method, url,
@@ -165,7 +182,30 @@ class AsyncHTTPClient:
                         body = await r.read()
                         body = body[:body_limit]
                         await self._stealth_delay()
-                        return Response(r.status, dict(r.headers), body, str(r.url))
+                        resp_obj = Response(r.status, dict(r.headers), body, str(r.url))
+
+                        # ── v7.1: audit log (compliance) ─────────────────────
+                        try:
+                            from utils import audit_log
+                            if audit_log.is_enabled():
+                                audit_log.log_request(method, url, status=r.status, response_size=len(body))
+                        except Exception:
+                            pass
+
+                        # ── v7.1: tracer (FP debug) ─────────────────────────
+                        try:
+                            from utils import tracer
+                            tracer.trace("http", "request",
+                                         method=method, url=url, status=r.status,
+                                         size=len(body))
+                        except Exception:
+                            pass
+
+                        # ── v7.1: adaptive rate feedback ────────────────────
+                        if adaptive is not None:
+                            adaptive.record_response(url, r.status)
+
+                        return resp_obj
 
                 except asyncio.TimeoutError:
                     pass

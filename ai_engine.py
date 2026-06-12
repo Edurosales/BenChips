@@ -27,6 +27,19 @@ _CONFIG_FILE = os.path.join(os.path.dirname(__file__), ".ai_config.json")
 
 
 def load_ai_config() -> dict:
+    """v7.1: intenta keyring del sistema primero, fallback a JSON 0600."""
+    try:
+        from utils.keyring_store import load_secret, has_keyring
+        if has_keyring():
+            raw = load_secret("vul_ai_config")
+            if raw:
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     if os.path.exists(_CONFIG_FILE):
         try:
             with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -38,16 +51,24 @@ def load_ai_config() -> dict:
 
 def save_ai_config(config: dict) -> None:
     """
-    Guarda la config con permisos restrictivos.
-    POSIX: 0600 (solo el dueño lee/escribe).
-    Windows: ACL no aplicable directamente; chmod 0600 funciona para herencia básica.
+    Guarda la config:
+      - v7.1: en keyring del SO si está disponible (Windows Credential Manager / Keychain).
+      - Fallback: JSON con chmod 0600.
     """
+    try:
+        from utils.keyring_store import store_secret, has_keyring
+        if has_keyring():
+            if store_secret("vul_ai_config", json.dumps(config)):
+                return
+    except Exception:
+        pass
+
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     try:
         os.chmod(_CONFIG_FILE, 0o600)
     except OSError:
-        pass  # Windows no siempre lo respeta; lo intentamos best-effort
+        pass
 
 
 class AIEngine:
@@ -321,6 +342,11 @@ Findings to analyze ({len(findings_list)} total):
 
 Analyze ALL findings. Apply strict FP rules. Detect attack chains. Return JSON array."""
 
+        # v7.1: program-specific addendum (H1 / Bugcrowd VRT / Intigriti / YesWeHack)
+        prog_instr = getattr(self, "_program_instructions", "") or ""
+        if prog_instr:
+            system = system + "\n\n" + prog_instr
+
         resp = await self._chat(system, user, max_tokens=4096)
         parsed = self._parse_json(resp)
 
@@ -506,10 +532,20 @@ Generate exact PoC and exploitation steps for each. Respond ONLY with JSON array
         target_url: str,
         meta: dict,
         duration: float,
+        program: str = "generic",
+        use_embeddings: bool = True,
+        use_feedback_loop: bool = True,
     ) -> dict:
         """
         Pipeline completo de 3 llamadas.
         Retorna un dict con toda la inteligencia generada.
+
+        Parámetros v7.1:
+          - program: 'h1' | 'bugcrowd' | 'intigriti' | 'yeswehack' | 'generic'
+                     ajusta los prompts según los criterios del programa.
+          - use_embeddings: agrupar duplicates con clustering local antes del triaje
+                            (reduce 3-4× los tokens enviados a la IA).
+          - use_feedback_loop: descartar patrones marcados FP por el usuario antes.
         """
         from utils.colors import print_info, print_ok, print_warn, print_err, spinner_async
 
@@ -526,10 +562,52 @@ Generate exact PoC and exploitation steps for each. Respond ONLY with JSON array
         if not vulns:
             return result
 
+        # ── v7.1: feedback loop pre-filter — descarta patrones FP conocidos ──
+        if use_feedback_loop:
+            try:
+                from utils.feedback_loop import filter_known_fps, boost_known_valid
+                vulns, dropped = filter_known_fps(vulns)
+                if dropped:
+                    print_ok(f"    Feedback loop: {len(dropped)} patrones FP conocidos pre-filtrados")
+                vulns = boost_known_valid(vulns)
+            except Exception:
+                pass
+
+        # ── v7.1: clustering local para reducir tokens ───────────────────────
+        cluster_mapping = {}
+        triage_input = vulns
+        if use_embeddings and len(vulns) > 5:
+            try:
+                from utils.embeddings import dedupe_for_ai
+                reps, cluster_mapping = dedupe_for_ai(vulns)
+                if len(reps) < len(vulns):
+                    print_ok(f"    Clustering: {len(vulns)} → {len(reps)} representantes "
+                             f"(ahorro ~{int(100*(1-len(reps)/len(vulns)))}% tokens)")
+                triage_input = reps
+            except Exception:
+                pass
+
+        # ── v7.1: program-specific prompt tuning ─────────────────────────────
+        try:
+            from utils.program_prompts import get_program_instructions
+            self._program_instructions = get_program_instructions(program)
+        except Exception:
+            self._program_instructions = ""
+
         try:
             # ── Llamada 1: Triaje masivo ─────────────────────────────────────────
-            async with spinner_async(f"[1/3] Triaje masivo de {len(vulns)} hallazgos (1 llamada)"):
-                triage = await self.mass_triage(vulns, target_url, meta)
+            async with spinner_async(f"[1/3] Triaje masivo de {len(triage_input)} hallazgos (1 llamada)"):
+                triage = await self.mass_triage(triage_input, target_url, meta)
+
+            # ── v7.1: propagar resultado del cluster representante a los miembros ─
+            if cluster_mapping:
+                expanded_triage = {}
+                for i, members in cluster_mapping.items():
+                    rep = members[0]
+                    rep_result = triage.get(rep.dedup_key, {})
+                    for m in members:
+                        expanded_triage[m.dedup_key] = dict(rep_result)
+                triage = expanded_triage
             result["triage"] = triage
 
             # Aplicar resultados — filtrar falsos positivos

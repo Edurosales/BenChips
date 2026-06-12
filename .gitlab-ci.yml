@@ -1,0 +1,42 @@
+# GitLab CI integration for BugBountyHunter Pro.
+# Solo para infra propia o con autorización.
+
+stages:
+  - test
+  - scan
+  - report
+
+variables:
+  PYTHON_VERSION: "3.11"
+
+tests:
+  stage: test
+  image: python:3.11-slim
+  script:
+    - cd Vul
+    - pip install -r requirements.txt
+    - python tests/run_all.py
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+security_scan:
+  stage: scan
+  image: python:3.11-slim
+  script:
+    - cd Vul
+    - pip install -r requirements.txt
+    - |
+      python cli.py scan "$SCAN_TARGET" \
+        ${FULL_SCAN:+--full} \
+        ${ACTIVE_SCAN:+--active} \
+        --report sarif --out gl-sast-report.json
+  artifacts:
+    when:                always
+    expire_in:           30 days
+    reports:
+      sast: Vul/gl-sast-report.json
+    paths:
+      - Vul/reports/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == "main" && $RUN_SECURITY_SCAN == "true"

@@ -137,12 +137,25 @@ def _prompt_options() -> dict:
     ports   = not ask("Omitir puertos    (port scan)")
     stealth = ask("Modo sigiloso     (UA rotation + delays, evita WAF/IDS)")
     ai_triage = ask("Triaje con IA    (elimina falsos positivos, estima bounty)", default_yes=True)
+
+    print(f"\n  {BOLD}Reportes:{W}")
     html    = ask("Generar reporte   HTML")
     json_r  = ask("Generar reporte   JSON")
     pdf     = ask("Generar reporte   PDF ejecutivo")
     md_h1   = ask("Generar reporte   Markdown HackerOne")
     md_bc   = ask("Generar reporte   Markdown Bugcrowd")
+    md_int  = ask("Generar reporte   Markdown Intigriti")
+    md_ywh  = ask("Generar reporte   Markdown YesWeHack")
+    md_all  = ask("Generar reporte   MD H1 SEPARADO por cada CRITICAL/HIGH")
     sarif   = ask("Generar reporte   SARIF (GitHub Code Scanning)")
+
+    print(f"\n  {BOLD}Modo avanzado (v7.1):{W}")
+    program  = input(f"  {C}?{W}  Programa de bounty (h1/bugcrowd/intigriti/yeswehack/generic) [generic]: ").strip().lower() or "generic"
+    scope_f  = input(f"  {C}?{W}  Archivo de scope (.vulscope.yaml) [Enter = ninguno]: ").strip() or None
+    audit    = ask("Audit log JSONL    (compliance, .vullogs/)")
+    adaptive = ask("Adaptive rate     (per-host concurrency)", default_yes=True)
+    tracer   = ask("Tracer JSON       (debug de FPs, .vultrace/)")
+    tui      = ask("TUI live dashboard (requiere Textual instalado)")
 
     print()
     out = input(f"  {C}?{W}  Nombre base del reporte (Enter = auto): ").strip()
@@ -164,9 +177,19 @@ def _prompt_options() -> dict:
         "pdf":       pdf,
         "md_h1":     md_h1,
         "md_bc":     md_bc,
+        "md_int":    md_int,
+        "md_ywh":    md_ywh,
+        "md_all":    md_all,
         "sarif":     sarif,
         "output":    out,
         "proxies":   proxies,
+        # v7.1
+        "program":   program,
+        "scope_file": scope_f,
+        "audit":     audit,
+        "adaptive":  adaptive,
+        "tracer":    tracer,
+        "tui":       tui,
     }
 
 
@@ -242,16 +265,28 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
 
     # ── Escaneo principal ─────────────────────────────────────────────────────
     proxies = opts.get("proxies") or []
+
+    # v7.1: tracer ID único por scan
+    tracer_id = None
+    if opts.get("tracer"):
+        import hashlib, time as _t
+        tracer_id = hashlib.md5(f"{url}{_t.time()}".encode()).hexdigest()[:12]
+
     try:
         vulns, meta, duration = await scan(
-            url         = url,
-            full_scan   = opts["full"],
-            scan_ports  = opts["ports"],
-            active_scan = opts["active"],
-            stealth     = opts.get("stealth", False),
-            auth_config = auth_config,
-            use_oob     = opts.get("active", False),  # OOB solo en modo activo
-            proxies     = proxies,
+            url           = url,
+            full_scan     = opts["full"],
+            scan_ports    = opts["ports"],
+            active_scan   = opts["active"],
+            stealth       = opts.get("stealth", False),
+            auth_config   = auth_config,
+            use_oob       = opts.get("active", False),  # OOB solo en modo activo
+            proxies       = proxies,
+            # v7.1 pluggables
+            scope_file    = opts.get("scope_file"),
+            audit_enabled = opts.get("audit", False),
+            tracer_id     = tracer_id,
+            adaptive      = opts.get("adaptive", False),
         )
     except Exception as e:
         print_err(f"Error durante el escaneo: {e}")
@@ -269,7 +304,12 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
         print()
         print_section("🤖 IA", "Análisis de Inteligencia Artificial — 3 llamadas totales")
 
-        ai_result = await ai_engine.full_analysis(vulns, url, meta, duration)
+        ai_result = await ai_engine.full_analysis(
+            vulns, url, meta, duration,
+            program          = opts.get("program", "generic"),
+            use_embeddings   = True,
+            use_feedback_loop = True,
+        )
 
         ai_analyses    = ai_result.get("triage", {})
         exec_summary   = ai_result.get("exec_summary", "")
@@ -493,6 +533,45 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
         except Exception as e:
             print_err(f"Error generando Markdown Bugcrowd: {e}")
 
+    if opts.get("md_int"):
+        md_path = base_path + ".intigriti.md"
+        try:
+            from report import generate_markdown_intigriti
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(generate_markdown_intigriti(
+                    url, vulns, meta, duration,
+                    ai_analyses=ai_analyses, exec_summary=exec_summary,
+                ))
+            generated.append(f"MD INT → {os.path.abspath(md_path)}")
+        except Exception as e:
+            print_err(f"Error generando Markdown Intigriti: {e}")
+
+    if opts.get("md_ywh"):
+        md_path = base_path + ".yeswehack.md"
+        try:
+            from report import generate_markdown_yeswehack
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(generate_markdown_yeswehack(
+                    url, vulns, meta, duration,
+                    ai_analyses=ai_analyses, exec_summary=exec_summary,
+                ))
+            generated.append(f"MD YWH → {os.path.abspath(md_path)}")
+        except Exception as e:
+            print_err(f"Error generando Markdown YesWeHack: {e}")
+
+    if opts.get("md_all"):
+        try:
+            from report import generate_markdown_h1_all
+            files = generate_markdown_h1_all(url, vulns, meta, duration, min_severity="HIGH")
+            split_dir = base_path + "_h1_split"
+            os.makedirs(split_dir, exist_ok=True)
+            for fname, body in files:
+                with open(os.path.join(split_dir, fname), "w", encoding="utf-8") as f:
+                    f.write(body)
+            generated.append(f"MD H1 ALL → {os.path.abspath(split_dir)}/  ({len(files)} archivos)")
+        except Exception as e:
+            print_err(f"Error generando MD H1 ALL: {e}")
+
     if opts.get("sarif"):
         sarif_path = base_path + ".sarif"
         try:
@@ -515,6 +594,34 @@ async def _run(url: str, opts: dict, ai_config: dict | None, auth_config=None):
     print(f"\n  {DIM}Duración total: {duration:.2f}s{W}\n")
 
 
+# ─── Web UI launcher ──────────────────────────────────────────────────────────
+
+def _launch_web_ui(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Arranca el servidor FastAPI + Web UI y abre el navegador."""
+    try:
+        import uvicorn  # type: ignore
+    except ImportError:
+        print_err("uvicorn no instalado. Instalar: pip install fastapi uvicorn")
+        print_info("Luego ejecutar: uvicorn utils.api_server:app --host 0.0.0.0 --port 8000")
+        return
+
+    import threading, webbrowser, time as _time
+
+    url = f"http://{host}:{port}"
+    print_ok(f"Web UI arrancando en {url}")
+    print_info("Pulsa Ctrl+C para detener el servidor.")
+
+    # Abrir navegador tras 1.2s (tiempo para que uvicorn esté listo)
+    def _open_browser():
+        _time.sleep(1.2)
+        webbrowser.open(url)
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+
+    from utils.api_server import app
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
@@ -522,7 +629,28 @@ def main():
 
     print(f"  {BOLD}BugBountyHunter Pro v{VERSION}{W} — IA + Vulnerabilidades web\n")
     print(f"  {DIM}Solo para uso ético en sistemas propios o con autorización explícita.{W}")
-    print(f"  {DIM}Cero falsos positivos. Análisis con IA. Estimación de recompensas.{W}\n")
+    print(f"  {DIM}Anti-FP fuerte (no garantía cero). Análisis con IA. Bounty estimate.{W}\n")
+
+    # ── Modo Web UI (API server + dashboard) ───────────────────────────────────
+    print(f"  {C}[W]{W} Modo Web UI (dashboard en navegador)  {C}[Enter]{W} Modo terminal\n", end="")
+    try:
+        choice = input(f"  {C}?{W}  Elige modo [w/Enter]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        choice = ""
+    if choice in ("w", "web", "gui", "ui"):
+        _launch_web_ui()
+        return
+
+    # ── v7.1: cargar .vulrc.yaml si existe ────────────────────────────────────
+    rc_data: dict = {}
+    try:
+        from utils.config_file import find_rc, load_rc
+        rc_path = find_rc()
+        if rc_path:
+            rc_data = load_rc(rc_path) or {}
+            print(f"  {G}✓{W}  Config cargada: {DIM}{rc_path}{W}")
+    except Exception:
+        pass
 
     # ── Setup de IA ────────────────────────────────────────────────────────────
     ai_config = None
@@ -545,7 +673,26 @@ def main():
         sys.exit(1)
 
     url  = _fix_url(raw_url)
+
+    # ── v7.1: check de resume para esta URL ───────────────────────────────────
+    try:
+        from utils import state as _state
+        if _state.has_resumable(url):
+            r = input(f"  {O}?{W}  Hay un scan previo de este target no completado. ¿Retomarlo? [s/N]: ").strip().lower()
+            if r not in ("s", "si", "sí", "y", "yes"):
+                _state.clear_state(url)
+    except Exception:
+        pass
+
     opts = _prompt_options()
+
+    # ── v7.1: aplicar defaults de .vulrc.yaml encima de los prompts ──────────
+    if rc_data:
+        try:
+            from utils.config_file import merge_opts_with_rc
+            opts = merge_opts_with_rc(opts, rc_data)
+        except Exception:
+            pass
 
     # ── Autenticación (opcional) ───────────────────────────────────────────────
     auth_config = None

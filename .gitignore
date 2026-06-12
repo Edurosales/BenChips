@@ -1,22 +1,71 @@
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
-reports/
-.env
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+
+# ── Entornos ─────────────────────────────────────────────────────────────────
 venv/
 env/
+.venv/
+ENV/
 
-# Configuración local con credenciales — NUNCA commitear
+# ── CREDENCIALES — NUNCA commitear ───────────────────────────────────────────
 .ai_config.json
 *.ai_config.json
-
-# Archivos de test con credenciales hardcodeadas
-test_groq_model.py
-test_groq_model2.py
-test_*.py
-
-# Otros archivos sensibles
-*.key
-*.pem
+.env
+.env.*
+*.env.local
 secrets.json
 credentials.json
+*.key
+*.pem
+
+# ── Tests con keys hardcodeadas ───────────────────────────────────────────────
+test_groq_model*.py
+test_api_key*.py
+
+# ── Runtime / logs / estado ───────────────────────────────────────────────────
+.vullogs/
+.vultrace/
+.vulstate/
+.vul/
+
+# ── Reportes generados ────────────────────────────────────────────────────────
+reports/
+scan_report_*.html
+scan_report_*.pdf
+scan_report_*.json
+scan_report_*.md
+report-*.md
+*.sarif
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+*~
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Playwright / videos PoC ───────────────────────────────────────────────────
+playwright-report/
+test-results/
+*.webm
+*.mp4
+poc_*.webm
+
+# ── Pytest / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml

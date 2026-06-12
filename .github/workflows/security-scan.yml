@@ -1,0 +1,74 @@
+name: BugBountyHunter Security Scan
+
+# Trigger: manual o cron weekly.
+# Para uso CONFINADO a tu propia infra. NO escanees terceros sin autorización.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "URL a escanear (debe ser propiedad tuya o con autorización)"
+        required: true
+      full_scan:
+        description: "Full scan (más profundo, más lento)"
+        type: boolean
+        default: false
+      active_scan:
+        description: "Escaneo activo (inyecciones)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 3 * * 1"  # Lunes 3 AM UTC
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # para subir SARIF al Security tab
+      contents:        read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          cd Vul
+          pip install -r requirements.txt
+          pip install pyyaml
+
+      - name: Run tests first
+        run: |
+          cd Vul
+          python tests/run_all.py
+
+      - name: Run scan
+        env:
+          TARGET:      ${{ inputs.target || vars.SECURITY_SCAN_TARGET }}
+          FULL_SCAN:   ${{ inputs.full_scan }}
+          ACTIVE_SCAN: ${{ inputs.active_scan }}
+        run: |
+          cd Vul
+          python cli.py scan "$TARGET" \
+            ${FULL_SCAN:+--full} \
+            ${ACTIVE_SCAN:+--active} \
+            --report sarif --out scan.sarif
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: Vul/scan.sarif
+          category:   bugbountyhunter-pro
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            Vul/scan.sarif
+            Vul/reports/

@@ -67,6 +67,40 @@ def generate_json(
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
 
+def _render_modules_coverage_html(meta: dict) -> str:
+    modules_run = meta.get("modules_run", [])
+    if not modules_run:
+        return ""
+    rows = ""
+    for m in modules_run:
+        name     = m.get("name", "?")
+        findings = m.get("findings", 0)
+        status   = m.get("status", "ok")
+        color    = "#3fb950" if findings == 0 else "#d29922" if findings < 3 else "#f85149"
+        badge    = f'<span style="color:{color};font-weight:bold">{findings}</span>'
+        st_color = "#3fb950" if status == "ok" else "#8b949e"
+        rows += (
+            f'<tr><td><code>{name}</code></td>'
+            f'<td style="text-align:center">{badge}</td>'
+            f'<td style="color:{st_color};text-align:center">{status}</td></tr>'
+        )
+    scan_flags = meta.get("scan_flags", {})
+    flags_html = " ".join(
+        f'<span style="background:#21262d;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-size:11px;color:#8b949e">{k}</span>'
+        for k, v in scan_flags.items() if v
+    )
+    return (
+        f'<div class="section"><h2>📋 Cobertura de módulos ejecutados ({len(modules_run)})</h2>'
+        f'<div style="margin-bottom:8px">{flags_html}</div>'
+        f'<table style="width:100%;border-collapse:collapse;font-size:13px">'
+        f'<thead><tr style="border-bottom:1px solid #30363d">'
+        f'<th style="text-align:left;padding:6px 8px;color:#8b949e">Módulo</th>'
+        f'<th style="text-align:center;padding:6px 8px;color:#8b949e">Hallazgos</th>'
+        f'<th style="text-align:center;padding:6px 8px;color:#8b949e">Estado</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table></div>'
+    )
+
+
 def _render_crawled_html(crawled_urls: list) -> str:
     if not crawled_urls or len(crawled_urls) <= 1:
         return ""
@@ -465,6 +499,7 @@ def generate_html(
 {f'<div class="section"><h2>Paths Sensibles ({len(meta.get("paths",[]))})</h2>{paths_html}</div>' if paths_html else ''}
 {f'<div class="section"><h2>API & Endpoints ({len(meta.get("api_endpoints",[]))})</h2>{apis_html}</div>' if apis_html else ''}
 {_render_crawled_html(meta.get("crawled_urls", []))}
+{_render_modules_coverage_html(meta)}
 {tests_html}
 
 
@@ -930,6 +965,35 @@ def generate_pdf(
         story.append(b_tbl)
         story.append(Spacer(1, 0.3*cm))
 
+    # ── Módulos ejecutados ────────────────────────────────────────────────────
+    modules_run = meta.get("modules_run", [])
+    if modules_run:
+        story.append(Paragraph(f"📋 Cobertura de Módulos ({len(modules_run)} ejecutados)", h2_style))
+        mod_data = [["Módulo", "Hallazgos", "Estado"]]
+        mod_styles_list = [
+            ("BACKGROUND",   (0,0), (-1,0), C_DARK),
+            ("TEXTCOLOR",    (0,0), (-1,0), rl_colors.white),
+            ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",     (0,0), (-1,-1), 7),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [rl_colors.HexColor("#f9f9f9"), rl_colors.white]),
+            ("GRID",         (0,0), (-1,-1), 0.3, rl_colors.HexColor("#dddddd")),
+            ("TOPPADDING",   (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 3),
+            ("LEFTPADDING",  (0,0), (-1,-1), 5),
+        ]
+        for m in modules_run:
+            findings = m.get("findings", 0)
+            color = "#27ae60" if findings == 0 else "#e67e22" if findings < 3 else "#c0392b"
+            mod_data.append([
+                Paragraph(f"<font name='Courier'>{m.get('name','?')}</font>", normal),
+                Paragraph(f"<font color='{color}'><b>{findings}</b></font>", normal),
+                Paragraph(m.get("status", "ok"), small),
+            ])
+        mod_tbl = Table(mod_data, colWidths=[doc.width*0.6, doc.width*0.2, doc.width*0.2], repeatRows=1)
+        mod_tbl.setStyle(TableStyle(mod_styles_list))
+        story.append(mod_tbl)
+        story.append(Spacer(1, 0.3*cm))
+
     # ── Footer ────────────────────────────────────────────────────────────────
     story.append(HRFlowable(width="100%", thickness=0.5, color=rl_colors.HexColor("#dddddd")))
     story.append(Paragraph(
@@ -942,6 +1006,30 @@ def generate_pdf(
 
 
 # ─── Markdown (HackerOne / Bugcrowd / genérico) ──────────────────────────────
+
+def _md_modules_coverage(meta: dict) -> list[str]:
+    modules_run = meta.get("modules_run", [])
+    if not modules_run:
+        return []
+    lines = [
+        "## Módulos ejecutados",
+        "",
+        f"| Módulo | Hallazgos | Estado |",
+        "|--------|:---------:|:------:|",
+    ]
+    for m in modules_run:
+        name     = m.get("name", "?")
+        findings = m.get("findings", 0)
+        status   = m.get("status", "ok")
+        badge    = f"⚠️ {findings}" if findings > 0 else "✅ 0"
+        lines.append(f"| `{name}` | {badge} | {status} |")
+    scan_flags = meta.get("scan_flags", {})
+    active_flags = [k for k, v in scan_flags.items() if v]
+    if active_flags:
+        lines += ["", f"**Flags activos:** `{'`, `'.join(active_flags)}`"]
+    lines.append("")
+    return lines
+
 
 def _md_severity_badge(sev: str) -> str:
     icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢", "INFO": "⚪"}
@@ -1113,6 +1201,7 @@ def generate_markdown_bugcrowd(
         out.append("---")
         out.append("")
 
+    out += _md_modules_coverage(meta)
     return "\n".join(out)
 
 
@@ -1140,6 +1229,7 @@ def generate_markdown_intigriti(
     cvss_str = f"{top.cvss}" + (f" — {cvss_vec}" if cvss_vec else "")
     poc = ai.get("poc_curl") or f"curl -i '{url}'"
 
+    coverage = "\n".join(_md_modules_coverage(meta))
     return f"""# {ai.get("report_title") or top.title}
 
 ## Issue
@@ -1177,7 +1267,8 @@ def generate_markdown_intigriti(
 ## References
 
 - {top.ref}
-"""
+
+{coverage}"""
 
 
 def generate_markdown_yeswehack(
@@ -1196,6 +1287,7 @@ def generate_markdown_yeswehack(
     ai = (ai_analyses or {}).get(top.dedup_key, {})
     cvss_vec = top.cvss_vector or ai.get("cvss_vector", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
     poc = ai.get("poc_curl") or f"curl -i '{url}'"
+    coverage = "\n".join(_md_modules_coverage(meta))
 
     return f"""# {top.title}
 
@@ -1239,7 +1331,75 @@ def generate_markdown_yeswehack(
 ## References
 
 - {top.ref}
+
+{coverage}"""
+
+
+# ─── Full per-vuln Markdown (todos los CRITICAL/HIGH, no solo el primero) ────
+
+def generate_markdown_h1_all(
+    url:        str,
+    vulns:      list[Vuln],
+    meta:       dict,
+    duration:   float,
+    min_severity: str = "HIGH",
+) -> list[tuple[str, str]]:
+    """
+    Genera un Markdown H1 INDEPENDIENTE por cada vuln CRITICAL/HIGH (o el filtro indicado).
+    Devuelve lista de (filename_sugerido, markdown_body) para que el caller los
+    grabe a disco.
+
+    Útil cuando quieres submittear cada finding como reporte separado en H1.
+    """
+    sev_order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+    threshold = sev_order.get(min_severity.upper(), 4)
+
+    eligible = [v for v in vulns if sev_order.get(v.severity, 0) >= threshold]
+    eligible.sort(key=lambda v: (-sev_order.get(v.severity, 0), -v.cvss))
+
+    out: list[tuple[str, str]] = []
+
+    for idx, v in enumerate(eligible, 1):
+        cwe_line   = f"**Weakness:** {v.cwe}\n" if v.cwe else ""
+        owasp_line = f"**OWASP:** {v.owasp}\n" if v.owasp else ""
+        vector     = f" `{v.cvss_vector}`" if v.cvss_vector else ""
+
+        body = f"""# {v.title}
+
+**Target:** {v.url or url}
+**Severity:** {v.severity} (CVSS {v.cvss}{vector})
+{cwe_line}{owasp_line}
+## Summary
+
+{v.description}
+
+## Steps to Reproduce
+
+```
+{v.evidence}
+```
+
+## Impact
+
+{v.description}
+
+## Remediation
+
+{v.fix}
+
+## References
+
+- {v.ref or 'N/A'}
+
+---
+*Generated by BugBountyHunter Pro v7.0 — finding {idx}/{len(eligible)}*
 """
+        # filename slug
+        slug = "".join(c if c.isalnum() else "_" for c in v.title[:60]).strip("_")
+        fname = f"{idx:02d}-{v.severity}-{slug}.md"
+        out.append((fname, body))
+
+    return out
 
 
 # ─── SARIF (GitHub Code Scanning compatible) ──────────────────────────────────
